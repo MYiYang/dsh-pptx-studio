@@ -74,6 +74,75 @@ await test('PythonRunner resolves a python with python-pptx (or degrades)', asyn
   const info = await runner.run('pptx_inspect.py', [out])
   assert.equal(info.ok, true)
   assert.equal(info.slideCount, 1)
+
+  // The writer must produce real OOXML for the PPTX features, not just a
+  // plausible model. Read the zip back with python's own zipfile.
+  const rich = {
+    version: 2,
+    id: 'deck_rich',
+    title: 'effects',
+    size: { w: 13.333, h: 7.5 },
+    theme: { colors: { accent: '22D3EE' }, fonts: { latin: '微软雅黑' } },
+    slides: [{
+      id: 's1',
+      notes: '特效测试备注',
+      hidden: true,
+      background: { color: '#060B18' },
+      transition: { type: 'push', speed: 'slow', direction: 'up', advanceOnClick: false, advanceAfterMs: 2000 },
+      elements: [
+        { id: 't', type: 'text', box: [1, 1, 4, 1], text: 'hello', shadow: true, anim: { effect: 'fade', duration: 600 } },
+        { id: 'c', type: 'chart', box: [6, 2, 5, 3], chart: { kind: 'pie', categories: ['A', 'B'], series: [{ name: 's', values: [1, 2] }] } },
+      ],
+    }],
+  }
+  const richFile = join(dir, 'rich.json')
+  writeFileSync(richFile, JSON.stringify(rich), 'utf8')
+  const richOut = join(dir, 'rich.pptx')
+  const built = await runner.run('pptx_build.py', [richFile, richOut])
+  assert.equal(built.features.transitions, 1)
+  assert.equal(built.features.timings, 1)
+  assert.equal(built.features.animations, 1)
+  assert.equal(built.features.notes, 1)
+  assert.equal(built.features.hidden, 1)
+  assert.equal(built.features.charts, 1)
+
+  const probeScript = [
+    'import json, sys, zipfile',
+    'import xml.etree.ElementTree as ET',
+    'p = sys.argv[1]',
+    'z = zipfile.ZipFile(p)',
+    'slide = z.read("ppt/slides/slide1.xml").decode("utf-8")',
+    'notes = ""',
+    'if "ppt/notesSlides/notesSlide1.xml" in z.namelist():',
+    '    notes = z.read("ppt/notesSlides/notesSlide1.xml").decode("utf-8")',
+    'root = ET.fromstring(slide)',
+    'children = [c.tag.split("}")[-1] for c in root]',
+    'print(json.dumps({',
+    '  "children": children,',
+    '  "transition": bool([c for c in children if c == "transition"]),',
+    '  "timing": bool([c for c in children if c == "timing"]),',
+    '  "hidden": root.get("show") == "0",',
+    '  "shadow": "outerShdw" in slide,',
+    '  "chart": any(n.startswith("ppt/charts/chart") for n in z.namelist()),',
+    '  "notes": "特效测试备注" in notes,',
+    '}, ensure_ascii=False))',
+  ].join('\n')
+  const probe = await runProcess(await runner.interpreter(), ['-c', probeScript, richOut], { timeoutMs: 60_000 })
+  assert.equal(probe.code, 0, probe.stderr)
+  const facts = parseJsonOutput(probe.stdout)
+  assert.deepEqual(facts.children, ['cSld', 'clrMapOvr', 'transition', 'timing'], 'OOXML child order must be transition then timing')
+  assert.equal(facts.transition, true)
+  assert.equal(facts.timing, true)
+  assert.equal(facts.hidden, true)
+  assert.equal(facts.shadow, true)
+  assert.equal(facts.chart, true)
+  assert.equal(facts.notes, true)
+
+  // `--no-effects` must be able to strip transitions/timing for compatibility.
+  const plainOut = join(dir, 'plain.pptx')
+  const plain = await runner.run('pptx_build.py', [richFile, plainOut, '--no-effects'])
+  assert.equal(plain.features.transitions, 0)
+  assert.equal(plain.features.timings, 0)
 })
 
 console.log(`\npython: ${passed} checks passed`)

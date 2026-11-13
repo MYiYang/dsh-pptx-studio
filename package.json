@@ -1,7 +1,7 @@
 {
   "name": "dsh-pptx-studio",
-  "version": "0.1.0",
-  "description": "PPTX Studio for DeepSeek Harness: a live right-side canvas that draws a deck slide by slide from a template or a long prompt, lets the user point at a problem element, and turns that note into a session message the agent can fix.",
+  "version": "0.2.0",
+  "description": "PPTX Studio for DeepSeek Harness: research → HTML mockup → editable PPTX, with a live canvas that edits slide transitions, animations, notes, themes and native charts.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -13,6 +13,7 @@
     "index.js",
     "client.js",
     "lib/",
+    "skills/",
     "assets/",
     "cordis.patch.yml",
     "REQUIREMENTS.md",
@@ -33,7 +34,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node test/model.test.js && node test/store.test.js && node test/python.test.js && node test/e2e.test.js && node test/client.test.js"
+    "test": "node test/model.test.js && node test/store.test.js && node test/python.test.js && node test/skills.test.js && node test/e2e.test.js && node test/client.test.js"
   },
   "dsh": {
     "bundle": {

@@ -29,11 +29,25 @@
 
 1. **右侧实时画布**
    - 自动或一键在右侧栏打开；左侧缩略图带 + 右侧当前页大画布 + 底部状态条。
+   - 缩略图与当前页同源：按 deck 的页尺寸（16:9 / 4:3 / 16:10 / A4）出图，用页面自己的底色，
+     元素位置、字号、表格列宽与实际页成同一比例；先整页布局再整体缩放，不是把元素按 1.65px
+     小字硬画进 88×60 的白底里。
    - 元素级渲染：文本、矩形、图片、线条、表格占位、图表占位；坐标系与 PowerPoint 一致（英寸/pt，16:9 13.333×7.5in）。
    - 支持缩放（适应宽度/100%）、翻页、全屏。
-2. **绘制过程可见**
-   - Agent 每新增/修改一页或一个元素，画布增量出现（淡入 + 描边动画），状态条显示「正在生成第 N 页 / 共 M 页」。
-   - 「跟随最新」开关：生成中自动跳到新页；用户手动回看某一页时暂停跟随。
+2. **绘制过程可见（不是「跑完突然出现」）**
+   - **打开时机**：`pptx_studio_open` 的工具卡片在 `preparing`/`start` 阶段就打开右侧画布，不等工具返回；
+     结果带回 `deckId` 后再把已打开的 tab 导航到这份 deck（换 build 时不会继续显示上一份）。
+   - **没有 deck 时也有编辑区**：画布渲染完整的编辑区/功能区 shell（纸面骨架 + 3 个灰色缩略图占位 +
+     分隔条），而不是一句空提示；Agent 一开画，内容就在已经存在的编辑区里生长，不挤压、不跳位。
+   - **逐页**：`pptx_studio_plan` 先发 `planning` 状态（「正在摆放 N 页骨架」），再每 160ms 落一页骨架；
+     写页前先发 `drawing(begin)`（「正在准备第 N 页」），220ms 后内容才到。
+   - **逐元素**：整页内容到达时，客户端先整页画成铅笔幽灵（虚线 + 低透明度），再按数组顺序每 42–75ms
+     落定一个元素；文本自左向右「写出来」，图形/图片/表格淡入 + 轻微缩放。
+   - **进度**：编辑区标题出现 ✎ 绘制徽标，画布左下角有绘制 HUD（第 N 页 · 元素 x/y + 进度条），
+     状态条同步；画完 0.7s 后 HUD 自动收起。
+   - **稳定性**：缩略图栏常驻（无页时放骨架格），编辑区有 `min-height` 兜底；生成期间编辑区/功能区
+     位置和高度不跳。
+   - 「跟随最新」开关：生成中自动跳到新页；用户手动回看某一页时暂停跟随（不会抢镜头）。
 3. **两种输入模式**
    - **模板模式**：用户提供 `.pptx` 模板（路径或上传）→ Host 解析母版、版式、占位符、主题色与字体 → 画布先画模板骨架（灰）→ Agent 按版式填内容。
    - **提示词模式**：长提示词 → Agent 先产大纲（画布上逐张出现页卡骨架），再逐页填充。
@@ -174,7 +188,10 @@ SSE 事件：
 
 ## 6. 验收标准
 
-1. 右侧栏能打开画布，`pptx_studio_slide` 连续写入 5 页时能看到逐页绘制动画；
+1. 右侧栏在 `pptx_studio_open` 一开始（`start`）就打开画布；`pptx_studio_slide` 连续写入 5 页时，
+   每页先出铅笔幽灵、再逐个元素落定，HUD/状态条显示当前页与元素进度；
+1.1 还没建 deck 时，画布也只有「编辑区 + 骨架纸面 + 缩略图占位 + 功能区」的完整 shell，不出现空白提示；
+1.2 缩略图的底色、页尺寸比例、元素位置与当前页一致（深色稿的缩略图也是深色；4:3 稿不会被压成 16:9）；
 2. 点击任意文本元素能选中并显示 slide/element/bbox 信息；
 3. 点「发给 DSH」后，当前会话出现含 slide 序号、element id、bbox、用户意见的结构化消息；
 4. Agent 执行 `pptx_studio_patch` 后画布 ≤1s 更新，被改元素有高亮；
@@ -199,3 +216,185 @@ SSE 事件：
 - M3：右侧画布渲染 + 增量动画 + 缩略图。
 - M4：选中/框选 → 意见 → 发回会话闭环。
 - M5：模板解析与版式继承；验收 1-6 全过。
+
+## 9. v2 增量需求：调研 → HTML → PPTX，以及幻灯片特效
+
+> v1 解决的是「画布实时可见 + 点元素反馈」；v2 要把生成过程变成有依据的设计流程，并让画布编辑覆盖 PPTX 的常用能力。
+
+### 9.1 目标
+
+1. **先生成依据，再生成文件**：模型不得直接吐 PPTX；先交需求分析/调研（受众、目标、大纲、事实与来源、视觉方向），
+   用户能先审这份分析。
+2. **先看 HTML 效果，再落 PPTX**：第二步交一份自包含 HTML 视觉稿，画布用沙箱 iframe 直接渲染；
+   用户在生成 PPTX 前先确认版式、配色和字体。
+3. **画布编辑具备 PPTX 常用能力**：至少覆盖幻灯片转场、元素入场动画、演讲者备注、页面背景、隐藏页、
+   主题色/字体、画布尺寸、原生图表、表格、形状/阴影、富文本段和模板版式选择；这些能力必须真正写进 `.pptx`，
+   不能只停留在画布。
+
+### 9.2 功能需求（P0）
+
+1. **三步流水线**
+   - 新 deck 的 `pipeline.stage` 依次为 `research → preview → build`；阶段由「是否有 research / preview / builtAt」派生。
+   - 新 deck 直接调 `plan/slide/add_element/export` 返回 `stage-research` 或 `stage-preview`，并给出下一步提示与 `force:true` 逃生口。
+   - 已有页面的旧 deck 或用户手工加页的 deck 视为已构建，不被流程卡住（向后兼容）。
+   - 画布顶栏显示三步条；已完成打勾，点击切换面板；默认跟随当前阶段。
+2. **调研分析**
+   - `pptx_studio_research` 接收 `brief`：摘要、受众、目标、语气、约束、逐页大纲、关键结论、来源、
+     配色与字体方向；写入 `deck.pipeline.research` 并持久化。
+   - 画布「① 调研」面板显示上述内容；来源 URL 只接受 http(s)，可点击；空 brief 被拒绝。
+   - 调研面板的意见通过 `/feedback` 的 `stage=research` 送回会话，提示模型先更新分析。
+3. **HTML 效果预览**
+   - `pptx_studio_preview` 接收自包含 HTML（≤400KB）与可选的设计画布尺寸 `width/height`（px），写入
+     `deck.pipeline.preview` 与 `preview.html`。画布按该尺寸等比缩放到侧栏宽度，不拉伸、不裁掉整页；
+     未声明尺寸时从 HTML 的 `.slide` 宽度或 deck 尺寸推断，并预留常见的外边距。
+   - 画布「② HTML」用 `<iframe sandbox="">` 指向 `GET /preview?deck=`；服务端同时下发 CSP `sandbox`，
+     禁止脚本与外链样式，避免模型产出的 HTML 在 DSH 源里执行。
+   - 支持刷新、新窗口打开、下载 HTML；预览面板的意见以 `stage=preview` 送回会话，要求先改预览再同步幻灯片。
+4. **幻灯片特效与 PPTX 能力**
+   - **转场**：`slide.transition` 支持 none/fade/push/wipe/split/cover/pull/cut/zoom/dissolve/circle/random，
+     speed slow/medium/fast，direction left/right/up/down，advanceOnClick/advanceAfterMs；画布可预览；
+     导出为 `<p:transition>`。
+   - **入场动画**：`element.anim` 支持 appear/fade/wipe/zoom + direction/duration/delay/order；画布可单元素预览，
+     转场预览时按 order/delay 依次播放；导出为 `<p:timing>` 的 clickEffect 序列。
+   - **演讲者备注**：`slide.notes`，画布可编辑，导出到 notes slide。
+   - **页面背景**：`slide.background.color`，画布与导出同步。
+   - **隐藏页**：`slide.hidden`，缩略图标记，导出 `p:sld show="0"`。
+   - **主题与尺寸**：`deck.theme.colors/fonts`、`deck.size`；画布有主题面板和 16:9/4:3/16:10/A4 预设；
+     导出应用默认字体/文字色与画布尺寸。
+   - **原生图表**：`element.chart` 支持 column/bar/line/pie/doughnut/area（categories + series），
+     画布用 SVG/HTML 近似，导出为真实 chart part。
+   - **表格 / 形状 / 阴影 / 富文本**：表格原生导出；rect 支持圆角/填充/描边/阴影；文本段落支持 runs。
+   - **模板版式**：模板模式下页面设置可选 `layoutIndex`，导出引用对应 `p:sldLayout`。
+5. **画布操作补充**
+   - 页面设置面板：转场、速度、方向、换页方式、背景色、隐藏页、备注、版式、预览切换。
+   - 主题面板：5 个主题色、字体、画布尺寸。
+   - 插入按钮：文本、图片、矩形、表格、图表。
+   - 属性面板：下划线、阴影开关、入场动画效果/方向/时长/预览。
+   - 撤销/重做 diff 覆盖 deck 级（title/theme/size）与 slide 级（transition/notes/background/hidden/layout）字段。
+
+### 9.3 数据契约增量（deck.json v2）
+
+```jsonc
+{
+  "version": 2,
+  "theme": { "colors": { "ink": "#0F172A", "muted": "#64748B", "accent": "#2563EB", "surface": "#F1F5F9", "background": "#FFFFFF" },
+             "fonts": { "latin": "微软雅黑", "ea": "微软雅黑", "heading": "微软雅黑" } },
+  "pipeline": {
+    "research": { "summary": "…", "audience": "…", "goal": "…", "tone": "…", "constraints": "…",
+                  "outline": [{ "title": "背景", "intent": "…", "source": "…" }],
+                  "facts": [{ "claim": "…", "source": "…" }],
+                  "sources": [{ "title": "…", "url": "https://…", "note": "…" }],
+                  "palette": ["#22D3EE"], "fonts": { "latin": "微软雅黑" }, "updatedAt": "…" },
+    "preview": { "html": "<!doctype html>…", "title": "视觉稿", "notes": "…", "width": 1008, "height": 588, "updatedAt": "…" },
+    "builtAt": "2026-11-13T09:00:00.000Z",
+    "stage": "build"
+  },
+  "slides": [{
+    "id": "s1", "notes": "演讲者备注", "hidden": true,
+    "background": { "color": "#060B18" },
+    "transition": { "type": "push", "speed": "slow", "direction": "up", "advanceOnClick": false, "advanceAfterMs": 2000 },
+    "elements": [{
+      "id": "e1", "type": "text", "box": [1, 1, 4, 1], "text": "标题",
+      "anim": { "effect": "fade", "direction": "left", "duration": 600, "delay": 0, "order": 0 },
+      "shadow": { "blur": 4, "distance": 3, "direction": 90, "color": "#000000", "alpha": 0.35 },
+      "paragraphs": [{ "text": "段", "runs": [{ "text": "run", "bold": true, "color": "#FFFFFF" }] }]
+    }]
+  }]
+}
+```
+
+### 9.4 验收标准
+
+1. 新 deck 未调 research 时 `plan/slide/export` 返回 `stage-research`；有 research 无 preview 时返回 `stage-preview`；
+   完成 preview 后放行；`force:true` 可显式跳过。
+2. 调研/HTML 两个面板能在画布上打开并显示宿主数据；HTML iframe 的 `src` 打到 `/preview`，带 sandbox。
+3. 画布改转场/备注/背景/隐藏/主题/尺寸后，`deck.json` 与 `.pptx` 同步；切换预览能在画布上看到 `data-fx` 动画。
+4. 导出的 `.pptx` 回读后：转场页数、timing 页数、动画数、备注页数、隐藏页数、图表数与模型一致；
+   OOXML 子元素顺序为 `cSld → clrMapOvr → transition → timing`。
+5. 图表为原生 chart part（`ppt/charts/chartN.xml`），可在 PowerPoint 中编辑数据；文本/形状/表格保持可编辑。
+6. `npm test` 全绿（model/store/python/e2e/client）。
+
+### 9.5 非目标（v2 仍不做）
+
+- 组合形状、SmartArt、group 的 1:1 渲染；仍以占位/近似处理。
+- PowerPoint 的复杂动画时间轴、motion path、触发器、退出动画、转场 morph。
+- 多人协同评论、审阅模式、版本历史（v1 P1 仍未做）。
+- HTML 预览执行脚本或访问外网；它只用于静态视觉确认。
+
+
+## 10. v3 增量需求：编辑区/功能区视觉分界与 PPTX 快捷键
+
+### 10.1 目标
+
+1. **一眼能分清在哪儿编辑、在哪儿操作**：编辑画布与控件面板不能混成一条长列表。
+2. **常用 PPTX 快捷键可用**：保存、剪切/复制/粘贴、撤销/重做、复制、新建页、删除、微调、缩放。
+
+### 10.2 功能需求（P0）
+
+1. **视觉分界**
+   - 编辑区为独立卡片：`--ps-border-strong` 边框、标题行「编辑区 · 幻灯片编辑/调研/HTML 预览」、浅灰底；
+     幻灯片纸面保留自有背景。
+   - 功能区为独立卡片：标题行「功能区」，包含状态、缩放、页操作、插入、属性、动效、主题和意见；
+     `max-height` + 内部滚动，内容多时只滚动功能区，不挤压编辑区。
+   - 中间有可见分隔条，带「编辑区 / 功能区」说明；窄侧栏也保持上下分界。
+2. **快捷键**
+   - `Ctrl+S` 保存/导出 PPTX（输入框里也生效）；`Ctrl+Shift+S` 导出并下载。
+   - `Ctrl+Z` / `Ctrl+Shift+Z` / `Ctrl+Y` 撤销/重做；输入框内保留浏览器原生文字撤销。
+   - `Ctrl+X/C/V` 剪切/复制/粘贴元素；内部剪贴板 + 系统剪贴板 JSON；输入框内保留原生复制粘贴。
+   - `Ctrl+A` 选中本页全部元素（多选显示虚线框 + 批量面板）；`Ctrl+D` 复制一份；`Ctrl+M` 新增一页。
+   - `Delete/Backspace` 删除选中元素；方向键微调；`Ctrl+0` / `Ctrl±` 缩放；`Esc` 取消；`?` 切换帮助。
+   - 多选批量删除/粘贴应作为**一步**进入撤销栈。
+3. **帮助与可发现性**
+   - 功能区右上角有「快捷键」按钮，打开快捷键表；画布 `?` 也可切换。
+
+### 10.3 验收标准
+
+1. DOM 中存在 `data-ps-editor`、`data-ps-controls`、`data-ps-split`，且样式包含强边框/分隔条。
+2. 画布根节点的按键处理覆盖上述快捷键；`Ctrl+S` 触发 `/export`，`Ctrl+M` 触发 `slide.add`，
+   `Ctrl+C/V` 产生 `element.add`，`Ctrl+X` 产生 `element.patch {remove:true}`，`Ctrl+Z` 产生撤销 diff。
+3. 在 `textarea` 内按 `Ctrl+Z` 不触发画布撤销；`Ctrl+S` 仍保存。
+4. `Ctrl+A` 后 `Delete` 一次提交 N 条删除 op；撤销可一步恢复。
+5. 快捷键帮助面板列出主要键位。
+6. `npm test` 全绿（model 23 / store 7 / python 4 / e2e 19 / client 19）。
+
+---
+
+## 11. v3 增量：插件自带技能，约束「写 pptx 必须走插件」
+
+### 11.1 背景
+
+真机会话里官人说「生成一个充满科技感风格的 ppt」，模型没调任何 `pptx_studio_*`，而是照
+`~/.dsh/skills/pptx-research-deck/SKILL.md` 写了 `build_deck.py` 走 python-pptx。
+根因：工具表只在模型「想找工具」时说话；技能表里那份 user 技能 description 逐字就是「用 python-pptx 从零生成」，
+先声夺人。插件当时没有任何约束通道（`index.js` 里只有 `tools.register` 与 `webServer.register`）。
+
+### 11.2 需求
+
+1. 插件的约束要随包走：装插件即生效，卸载即撤回；不往 `~/.dsh/skills` 抄副本，也不写进长期记忆。
+2. 约束以「技能」形式出现在宿主技能表里，description 与正文都要写明：`.pptx` 目的产物只用 `pptx_studio_*`，
+   禁止 python-pptx 从零拼；与 `pptx-research-deck` / `office-pptx` 的手搓路线冲突时以本技能为准；
+   例外只有「用户明说不要用插件」与「工具表里没有」两条。
+3. 技能里给全七步工具链与坑位（英寸/pt/px 三种单位、阶段闸门、越界、图表字段）。
+4. 可单独关闭（`config.skill === false`），且宿主缺 `skills` 服务时降级为一条日志，不影响插件加载。
+
+### 11.3 实现
+
+- `skills/pptx-studio/SKILL.md`：规则四条 + When to use / Steps / Pitfalls / Verification。
+- `lib/skills.js`：`parseFrontmatter` / `readSkill` / `loadBundledSkills` / `skillRegistration` / `registerBundledSkills`；
+  注册走 `ctx.inject(['skills'])` → `skills.register()`，返回的 disposer 再包进 `scope.effect`，随 fiber 卸载撤回。
+- `skillRegistration()` **必须带 `source`**：注册表按 `SkillDefinition` 校验，缺 `source` 时 `skill` 工具报
+  `loaded skill "pptx-studio" source must be a string`（只有 `invocation` / `provider` 有默认值）。
+- `index.js`：`apply()` 末尾接线；`GET /api/health` 回带 `skills: [...]`。
+
+### 11.4 验收标准
+
+1. `npm test` 全绿（model 23 / store 7 / python 4 / skills 14 / e2e 20 / client 25 = 93）。
+2. 禁用再启用 `include:dsh-pptx-studio` 后，本会话技能表里出现 `pptx-studio`；再禁用则消失（证明注册挂在插件 fiber 上）。
+3. `skill` 工具能加载 `pptx-studio`，返回正文与 `resourceBase` 目录。
+4. 新会话只给「生成一个充满科技感风格的 ppt」：首个制作动作是 `pptx_studio_open`，全程无 `.py` 落盘。
+5. 工作区 `.tmp/skill-probe` 探针留下的只有 `.pptx-studio/deck_*/{deck.json,preview.html}`，均为插件自产。
+
+### 11.5 已知缺口
+
+- 本层是「可被发现、可被说服」，不是硬拦：模型若执意手写脚本，仍需 `tools.guard` 兜底（未做，待批）。
+- `~/.dsh/skills/pptx-research-deck` 原样保留，只被本技能第 3 条压住；要收窄它得单独动家目录。
