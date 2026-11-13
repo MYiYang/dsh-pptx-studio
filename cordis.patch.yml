@@ -1,0 +1,12 @@
+# dsh-pptx-studio bundle patch.
+#
+# Mounts the Host half: seven model-facing `pptx_studio_*` tools, an SSE stream
+# under /dsh-pptx-studio/api/events for the right-side canvas, a feedback route
+# that injects the user's note into the owning session, and an export route that
+# shells out to the bundled python-pptx writer.
+#
+# The package's `dsh.client` declaration makes the Web carrier serve client.js
+# (the right-side canvas + tool-card entry), so the patch needs no extra UI row.
+- insert:
+    - id: dsh-pptx-studio
+      name: 'dsh-pptx-studio'
