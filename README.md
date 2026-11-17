@@ -20,15 +20,15 @@ Agent：pptx_studio_template ─► 画布「⓪ 模板」面板（每页角色/
 
 画布开在右侧栏，阶段条 `⓪ 模板 → ① 调研 → ② HTML → ③ 幻灯片` 串起整条链路；左侧对话里每调一次工具，右侧便切到对应的 deck 并往下画，不必等导出才看见成果。
 
-![画布全貌：阶段条、缩略图条、编辑区与功能键](https://raw.githubusercontent.com/MYiYang/dsh-pptx-studio/master/docs/images/canvas-overview.png)
+![画布全貌：阶段条、缩略图条、编辑区与功能键](docs/images/canvas-overview.png)
 
 画布全貌。顶部是阶段条与缩略图条，中间是编辑区（此处第 1/8 页、58% 缩放），底部功能键管「保存 / 下载」，下面还有元素、动效、主题、增页与撤销。
 
-![对话与画布同步：逐页逐元素的绘制进度](https://raw.githubusercontent.com/MYiYang/dsh-pptx-studio/master/docs/images/live-drawing.jpg)
+![对话与画布同步：逐页逐元素的绘制进度](docs/images/live-drawing.jpg)
 
 边聊边画。左侧每次 `pptx_studio_slide` 落地，右侧就画到同一页，进度读到「正在绘制第 10 页 · 元素 34/34」；「跟随最新」可随时暂停。
 
-![选中元素后的属性面板](https://raw.githubusercontent.com/MYiYang/dsh-pptx-studio/master/docs/images/element-inspector.jpg)
+![选中元素后的属性面板](docs/images/element-inspector.jpg)
 
 元素级编辑。点中文字后直接改字号、粗体、对齐、颜色、填充，挑入场动画与阴影，调 X/Y/W/H（英寸）；改不满意，把话写进输入框点「发给 DSH」，或按「太挤」「字号太小」这类快捷键。
 
