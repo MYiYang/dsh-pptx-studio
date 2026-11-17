@@ -397,7 +397,7 @@ SSE 事件：`deck`（全量）`pipeline`（阶段变化）`slide`（新增/替�
     - id: dsh-pptx-studio
       name: 'dsh-pptx-studio'
       config:
-        python: 'C:/path/to/python.exe'   # 可选：固定解释器
+        python: '<python 可执行文件的绝对路径>'   # 可选：固定解释器
 ```
 
 ## 安装 / 卸载 / 更新
@@ -442,7 +442,7 @@ npm test     # model / template / store / python / skills / e2e / client 七组
 - 真 DOM 冒烟（真 React 18 + jsdom，65 项）：点选、拖动提交 box、拖角缩放、双击改字、缩略图切页、
   方向键微调、框选、插图上传、反馈 sendDraft+submit、导出/下载/关闭；外加无 deck 骨架 shell、
   工具卡片 start 阶段自动打开、SSE 新页幽灵→逐个落定→HUD 收起、生成中编辑区不消失。
-  脚本在 `%TEMP%/dsh-pptx-smoke/smoke.mjs`（依赖本机其它 checkout 的 node_modules，故不入库）。
+  脚本放在本机临时目录（依赖本机其它 checkout 的 node_modules，故不入库）。
 
 ## 已知边界
 

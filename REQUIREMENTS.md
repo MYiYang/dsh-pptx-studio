@@ -162,7 +162,7 @@ SSE 事件：
 { "type": "slide",  "seq": 13, "slide": { "...": "新增/替换一页" }, "index": 2, "total": 8 }
 { "type": "element","seq": 14, "slideId": "s3", "element": { "...": "新增/替换一个元素" } }
 { "type": "status", "seq": 15, "phase": "drawing", "slideIndex": 3, "total": 8, "message": "正在生成第 3 页" }
-{ "type": "saved",  "seq": 16, "path": "F:/.../deck.pptx", "bytes": 102141 }
+{ "type": "saved",  "seq": 16, "path": ".pptx-studio/<deckId>/deck.pptx", "bytes": 102141 }
 ```
 
 工具面（模型可见）：

@@ -46,7 +46,7 @@
 给某个 profile 装上（以本仓库绝对路径为例）：
 
 ```bash
-dsh plugin --profile <profile> add link:F:/ssdwork/vscode/work/zs/work/plugins/dsh-pptx-studio
+dsh plugin --profile <profile> add link:<本仓库的绝对路径>
 ```
 
 Electron 管理的 profile（例如桌面版 `desktop`）走插件管理器：
@@ -257,7 +257,7 @@ pptx_studio_verify → pptx_studio_export
     - id: dsh-pptx-studio
       name: 'dsh-pptx-studio'
       config:
-        python: 'C:/path/to/python.exe'
+        python: '<python 可执行文件的绝对路径>'
 ```
 
 没有 python-pptx 时，画布、调研、HTML 预览、大纲、元素编辑照常能用，**只有导出不可用**——工具会返回 `python-unavailable` 并告诉你下一步。
