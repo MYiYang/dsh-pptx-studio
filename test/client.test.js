@@ -56,6 +56,8 @@ function test(name, fn) {
 /** @type {{id: string, factory: (require: (name: string) => any) => any}} */
 let loaded = null
 const styleSheets = []
+/** Anchors the canvas clicks for the blob download channel (`href`, `download`). */
+const anchorClicks = []
 globalThis.window = {
   __ModuleLoader__: {
     load(entry) {
@@ -63,8 +65,36 @@ globalThis.window = {
     },
   },
 }
+globalThis.window.setTimeout = setTimeout
+globalThis.window.URL = {
+  createObjectURL: () => 'blob:dsh-test/1',
+  revokeObjectURL: () => {},
+}
+/** Fake DOM body: the blob channel appends its anchor here, then removes it. */
+const domBody = {
+  children: [],
+  appendChild(element) { this.children.push(element) },
+  removeChild(element) { this.children.splice(this.children.indexOf(element), 1) },
+}
 globalThis.document = {
+  body: domBody,
   createElement: (tag) => {
+    if (tag === 'a') {
+      const anchor = {
+        tag,
+        href: '',
+        download: '',
+        rel: '',
+        style: {},
+        parentNode: null,
+        click() { anchorClicks.push({ href: anchor.href, download: anchor.download }) },
+        remove() {
+          if (anchor.parentNode) anchor.parentNode.removeChild(anchor)
+          anchor.parentNode = null
+        },
+      }
+      return anchor
+    }
     assert.equal(tag, 'style')
     const element = {
       tag,
@@ -328,11 +358,99 @@ const PIPELINE_DECK = {
   }],
 }
 
+/**
+ * Template-first pipeline deck: the host reports the template as decomposed and
+ * each slide names the template page it was built from.
+ */
+const TEMPLATE_DECK = {
+  ...PIPELINE_DECK,
+  id: 'deck_tpl',
+  pipeline: {
+    ...PIPELINE_DECK.pipeline,
+    stage: 'build',
+    template: {
+      path: 'F:/tmp/template.pptx',
+      required: true,
+      decomposedAt: '2026-11-16T08:00:00.000Z',
+      pages: 3,
+      engine: 'libreoffice',
+      textHidden: true,
+      design: null,
+    },
+  },
+  slides: [{ ...PIPELINE_DECK.slides[0], templateSlide: 1 }],
+}
+
+/** Template mode before `pptx_studio_template` ran: stage ⓪ is in progress. */
+const TEMPLATE_PENDING_DECK = {
+  ...HOST_DECK,
+  id: 'deck_tpl_pending',
+  slides: [],
+  pipeline: {
+    stage: 'template',
+    research: null,
+    preview: null,
+    builtAt: null,
+    template: { path: 'F:/tmp/pending.pptx', required: true, decomposedAt: null, pages: 0, engine: '', textHidden: false, design: null },
+  },
+}
+
+/** Response of `GET /api/template`, shaped exactly like the host route. */
+const TEMPLATE_CATALOGUE = {
+  summary: {
+    pages: 3,
+    size: { w: 13.333, h: 7.5 },
+    engine: 'libreoffice',
+    textHidden: true,
+    roles: { cover: 1, content: 1, ending: 1 },
+    families: 2,
+    palette: ['#0F172A', '#22D3EE', '#F59E0B'],
+    fonts: { title: '思源黑体', body: '微软雅黑' },
+    fields: 5,
+  },
+  size: { w: 13.333, h: 7.5 },
+  design: {
+    palette: [{ hex: '#0F172A', share: 0.62 }, { hex: '#22D3EE', share: 0.18 }, { hex: '#F59E0B', share: 0.05 }],
+    background: '#FFFFFF',
+    fonts: { title: '思源黑体', body: '微软雅黑' },
+    fontUsage: [{ name: '思源黑体', count: 6 }, { name: '微软雅黑', count: 11 }],
+    textColors: [{ hex: '#0F172A', count: 9 }],
+  },
+  families: [{ id: 'f1', role: 'cover', slides: [0] }, { id: 'f2', role: 'content', slides: [1, 2] }],
+  pages: [
+    {
+      page: 0, role: 'cover', family: 'f1', capacity: { fields: 2, maxCjk: 42, bodyMaxCjk: 0 }, guidance: '封面只放标题与副标题',
+      fields: [
+        { id: 'title', sample: '2026 年度战略规划', maxCjk: 18, box: [1, 1, 8, 1], perChar: false },
+        { id: 'subtitle', sample: '汇报人：张三', maxCjk: 24, box: [1, 2.4, 8, 0.6], perChar: false },
+      ],
+    },
+    {
+      page: 1, role: 'content', family: 'f2', capacity: { fields: 2, maxCjk: 134, bodyMaxCjk: 120 }, guidance: '正文一页一个结论',
+      fields: [
+        { id: 'heading', sample: '市场回顾', maxCjk: 14, box: [0.8, 0.6, 10, 0.8], perChar: false },
+        { id: 'body', sample: '上半年增长 18%，下半年继续投入。', maxCjk: 120, box: [0.8, 1.8, 11, 4], perChar: false },
+      ],
+    },
+    {
+      page: 2, role: 'ending', family: 'f2', capacity: { fields: 1, maxCjk: 8, bodyMaxCjk: 0 }, guidance: '结尾页',
+      fields: [{ id: 'thanks', sample: '谢谢观看', maxCjk: 8, box: [4, 3, 5, 1], perChar: false }],
+    },
+  ],
+  mapping: [
+    { templateSlide: 0, title: '封面', fields: { title: '2026 年度战略规划', subtitle: '汇报人：张三' } },
+    { templateSlide: 1, title: '市场回顾', fields: { heading: '市场回顾', body: '上半年增长 18%' } },
+  ],
+}
+
 /** Deck currently served by the `/api/state` stub. */
 let stateDeck = () => HOST_DECK
 
 /** Deck list served by the `/api/decks` stub (tests override it for the empty state). */
 let deckList = () => [{ id: 'deck_test', title: '画布渲染测试', slides: 1, sessionId: 'sess-1' }]
+
+/** Template catalogue served by the `/api/template` stub; null → 404 (not decomposed). */
+let templateDoc = () => null
 
 /** Tab navigation params handed to the canvas (the tool card rewrites them). */
 let tabParams = {}
@@ -341,23 +459,65 @@ let tabParams = {}
 const fetches = []
 /** @type {any} */
 let eventSource = null
+/** @type {any} */
+let sessionSource = null
+/** Task snapshot served by `GET /api/session` (the host's activity feed). */
+let sessionTask = () => null
+/** Artificial latency of `GET /api/state` (exercises the stale-response guard). */
+let stateDelayMs = 0
 globalThis.fetch = async (url, init) => {
   const href = String(url)
   fetches.push({ url: href, init })
   const json = (value) => ({ ok: true, status: 200, text: async () => JSON.stringify(value) })
   if (href.includes('/api/decks')) return json({ ok: true, decks: deckList() })
-  if (href.includes('/api/state')) return json({ ok: true, deck: stateDeck(), template: null })
+  if (href.includes('/api/session?')) return json({ ok: true, task: sessionTask() })
+  if (href.includes('/api/template')) {
+    const doc = templateDoc()
+    return doc
+      ? json({ ok: true, ...doc })
+      : { ok: false, status: 404, text: async () => JSON.stringify({ ok: false, code: 'template-missing' }) }
+  }
+  if (href.includes('/api/state')) {
+    if (stateDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, stateDelayMs))
+    return json({ ok: true, deck: stateDeck(), template: null })
+  }
   if (href.includes('/api/deck/delete')) return json({ ok: true, deckId: 'deck_test', removed: true })
+  if (href.includes('/api/download')) {
+    return {
+      ok: true,
+      status: 200,
+      text: async () => '',
+      blob: async () => ({ size: 2048, type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' }),
+    }
+  }
   if (href.includes('/api/edit')) return json({ ok: true, results: [] })
   if (href.includes('/api/feedback')) return json({ ok: true, delivered: true, text: 'sent' })
   if (href.includes('/api/upload')) return json({ ok: true, element: { id: 's1-e9', type: 'image', box: [1, 1, 3, 2], src: 'assets/img_new.png' } })
-  if (href.includes('/api/export')) return json({ ok: true, value: { path: 'F:/tmp/deck.pptx', bytes: 12345, slides: 1 } })
+  if (href.includes('/api/export')) {
+    // Echo the picked folder back, the way the real route names the file after
+    // the deck inside the folder it was given.
+    const body = init && init.body ? JSON.parse(String(init.body)) : {}
+    const dir = typeof body.dir === 'string' ? body.dir : 'F:/tmp'
+    return json({ ok: true, value: { path: `${dir}/deck.pptx`, bytes: 12345, slides: 1 } })
+  }
   return { ok: false, status: 404, text: async () => JSON.stringify({ ok: false, code: 'not-found' }) }
 }
 globalThis.EventSource = class {
-  constructor(url) { this.url = url; this.onopen = null; this.onerror = null; this.onmessage = null; eventSource = this }
+  constructor(url) {
+    this.url = url
+    this.onopen = null
+    this.onerror = null
+    this.onmessage = null
+    // Two streams exist per canvas now (the deck being drawn and the session's
+    // task feed); keep them apart so a test can drive the right one.
+    if (url.includes('/api/session/events')) sessionSource = this
+    else eventSource = this
+  }
   close() { this.closed = true }
 }
+
+/** Fresh ISO timestamp for a session-task payload. */
+const today = () => new Date().toISOString()
 
 const { react: fakeReact, render: renderTree, reset: resetRuntime } = makeReact()
 
@@ -381,8 +541,15 @@ const calls = {
   effects: 0,
   styleSheets: 0,
 }
+/**
+ * Stand-in for the Client `uiWorkspace` service. `null` means this build has no
+ * Host directory picker, which is the fallback path the download must survive.
+ * @type {{pickDirectory: () => Promise<string|null>}|null}
+ */
+let uiWorkspace = null
 const ctx = {
   logger: { warn() {}, error() {}, info() {}, debug() {} },
+  get: (name) => (name === 'uiWorkspace' ? uiWorkspace : undefined),
   locale: {
     register: (ns, id, dict) => { calls.locale.push([ns, id, Object.keys(dict).length]); return () => {} },
     bind: () => (key, values) => {
@@ -411,8 +578,20 @@ test('client.js loads through the module loader and declares its services', () =
   assert.equal(typeof module.apply, 'function')
 })
 
-test('apply registers one tab type, two bodies and one tool card', () => {
-  module.apply(ctx)
+test('apply registers one tab type, two bodies and a card per pptx tool', () => {
+  /** @type {any[]} */
+  const cardRegistrations = []
+  const captureCtx = {
+    ...ctx,
+    slots: {
+      inject: (name, body) => { calls.slots.push(name); return body() },
+      register: (spec, component) => {
+        if (spec.name === 'tool.call.toolview') cardRegistrations.push({ spec, component })
+        return { spec, component }
+      },
+    },
+  }
+  module.apply(captureCtx)
   assert.equal(calls.tabs.length, 1)
   const definition = calls.tabs[0]
   assert.equal(definition.id, 'dsh-pptx-studio/canvas')
@@ -423,8 +602,20 @@ test('apply registers one tab type, two bodies and one tool card', () => {
   assert.deepEqual(calls.slots, [
     'sidebar.right.pane.tab',
     'sidebar.right.pane.tab.title',
-    'tool.call.toolview',
+    ...Array(12).fill('tool.call.toolview'),
   ])
+  // Every step needs its own card: the keyed toolview only renders for its own
+  // wire name, so one card for `pptx_studio_open` leaves the other eleven steps
+  // with no way to switch the canvas.
+  assert.equal(cardRegistrations.length, 12, 'every pptx tool must get a card')
+  assert.deepEqual(cardRegistrations.map((row) => row.spec.key), [
+    'pptx_studio_open', 'pptx_studio_template', 'pptx_studio_research', 'pptx_studio_preview',
+    'pptx_studio_deck', 'pptx_studio_plan', 'pptx_studio_slide', 'pptx_studio_add_element',
+    'pptx_studio_patch', 'pptx_studio_inspect', 'pptx_studio_verify', 'pptx_studio_export',
+  ])
+  for (const row of cardRegistrations) {
+    assert.equal(typeof row.spec.inject, 'function', `${row.spec.key} must receive the opener`)
+  }
   assert.ok(calls.locale.some(([ns, id, keys]) => ns === 'pptxStudio' && id === 'zh' && keys > 60), 'zh dictionary missing entries')
   assert.ok(calls.locale.some(([, id]) => id === 'en'), 'en dictionary missing')
   assert.equal(styleSheets.length, 1, 'one stylesheet must be mounted')
@@ -440,6 +631,11 @@ test('the stylesheet follows the DSH theme instead of hard-coding a palette', ()
   assert.ok(css.includes('--ps-fg:var(--dsw-alias-label-primary'), 'text colour must come from the label token')
   assert.ok(css.includes('--ps-border:var(--dsw-alias-border-l1'), 'borders must come from the border token')
   assert.ok(css.includes('--ps-hover:var(--dsw-alias-interactive-bg-hover'), 'hover must come from the interactive token')
+  // Tool cards render in the conversation, not inside the canvas tab, so they
+  // need the same alias block or their borders/colours resolve to nothing.
+  assert.ok(css.includes('.ps-root,.ps-scope{'), 'the tool card surface must carry the token aliases too')
+  assert.ok(css.includes('.ps-task{'), 'the running-step strip needs its own rule')
+  assert.ok(css.includes('.ps-tab-dot'), 'the tab title needs its live dot')
   assert.ok(/\.ps-preview-wrap\{[^}]*min-height:220px/.test(css), 'the HTML preview viewport needs a non-collapsing minimum height')
   assert.ok(!/\.ps-preview-frame\{[^}]*width:100%/.test(css), 'the preview iframe must take its design width from the inline scale styles')
   const primaryRule = css.slice(css.indexOf('.ps-btn.primary{'), css.indexOf('.ps-btn.primary{') + 240)
@@ -468,9 +664,11 @@ let canvasTree = null
 let canvasProps = null
 /**
  * Render the canvas body with the capture ctx.
+ * @param {string} [sessionId] - session to mount (each task-feed test needs a
+ *   fresh one: the feed is cached per session for the life of the page).
  * @returns {Promise<any>} rendered tree.
  */
-async function mountCanvas() {
+async function mountCanvas(sessionId = 'sess-1') {
   canvasRuns += 1
   resetRuntime()
   /** @type {any} */
@@ -485,7 +683,7 @@ async function mountCanvas() {
   module.apply(captureCtx)
   assert.equal(typeof bodyComponent, 'function')
   canvasProps = {
-    sessionId: 'sess-1',
+    sessionId,
     t: (key, values) => (values ? String(key).replace(/\{(\w+)\}/g, (_, k) => String(values[k])) : String(key)),
     useTabInfo: () => ({
       tab: { id: 'tab-1', title: 'PPTX 画布', actions: { close: () => {} }, navigation: { params: tabParams } },
@@ -651,6 +849,208 @@ test('a deck id pushed through the tab params switches the open canvas', async (
   }
 })
 
+test('a pending call shows its own progress instead of the previous deck', async () => {
+  const session = 'sess-pending'
+  tabParams = { pending: '1', nonce: String(Date.now()) }
+  sessionTask = () => ({
+    sessionId: session, tool: 'pptx_studio_open', label: '打开画布', deckId: '',
+    state: 'running', message: '', startedAt: today(), updatedAt: today(), seq: 1,
+  })
+  try {
+    const before = fetches.length
+    await mountCanvas(session)
+    // The regression: the tab opened for a brand-new call and loaded the most
+    // recent deck on disk — the previous build — instead of showing this call.
+    assert.ok(!fetches.slice(before).some((f) => f.url.includes('/api/state')), 'a pending canvas must not load the previous deck')
+    const root = findAll(canvasTree, (n) => n.props && n.props['data-ps-root'])[0]
+    assert.equal(root.props['data-ps-root'], 'pending', 'the pending call needs its own shell state')
+    assert.equal(root.props['data-ps-pending'], 'true')
+    const banner = findAll(canvasTree, (n) => n.props && n.props['data-ps-task'])[0]
+    assert.ok(banner, 'the running step must be announced in the canvas itself')
+    assert.equal(banner.props['data-ps-task'], 'running')
+    assert.equal(banner.props['data-ps-tool'], 'pptx_studio_open')
+    assert.ok(treeText(canvasTree).includes('task.waitingTitle'), 'the shell must say it is preparing the new canvas')
+    assert.ok(!treeText(canvasTree).includes('画布渲染测试'), 'the previous deck title must not be on screen')
+  } finally {
+    tabParams = {}
+    sessionTask = () => null
+  }
+})
+
+test('a deck published by the session feed switches the open canvas', async () => {
+  const session = 'sess-switch'
+  sessionTask = () => ({
+    sessionId: session, tool: 'pptx_studio_open', label: '打开画布', deckId: '',
+    state: 'running', message: '', startedAt: today(), updatedAt: today(), seq: 1,
+  })
+  deckList = () => [
+    { id: 'deck_prev', title: '上一份 deck', slides: 1, sessionId: session },
+    { id: 'deck_next', title: '这一份 deck', slides: 1, sessionId: session },
+  ]
+  try {
+    await mountCanvas(session)
+    assert.ok(fetches.some((f) => f.url.includes('/api/state?deck=deck_prev')), 'the canvas starts on the newest deck on disk')
+
+    // The host publishes the deck the running call writes; the tab must follow
+    // even though the tool card that opened it may already be gone.
+    assert.ok(sessionSource && sessionSource.url.includes('/api/session/events'), 'the canvas must subscribe to the session feed')
+    sessionSource.onmessage?.({
+      data: JSON.stringify({
+        type: 'task',
+        task: {
+          sessionId: session, tool: 'pptx_studio_open', label: '打开画布', deckId: 'deck_next',
+          state: 'running', message: '', startedAt: today(), updatedAt: today(), seq: 2,
+        },
+      }),
+    })
+    for (let pass = 0; pass < 4; pass += 1) {
+      canvasTree = await rerender()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    assert.ok(fetches.some((f) => f.url.includes('/api/state?deck=deck_next')), 'the canvas must load the deck the call is writing')
+    assert.ok(eventSource && eventSource.url.includes('/api/events?deck=deck_next'), 'the deck stream must move to the new deck')
+
+    // The step and its deck stay visible in the canvas while it runs.
+    const banner = findAll(canvasTree, (n) => n.props && n.props['data-ps-task'])[0]
+    assert.ok(banner, 'the running step must stay announced')
+    assert.equal(banner.props['data-ps-deck'], 'deck_next', 'the banner must name the deck being written')
+
+    // A finished task hides the banner but keeps the canvas on the deck.
+    sessionSource.onmessage?.({
+      data: JSON.stringify({
+        type: 'task',
+        task: {
+          sessionId: session, tool: 'pptx_studio_open', label: '打开画布', deckId: 'deck_next',
+          state: 'done', message: '', startedAt: today(), updatedAt: today(), seq: 3,
+        },
+      }),
+    })
+    for (let pass = 0; pass < 3; pass += 1) {
+      canvasTree = await rerender()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    assert.equal(findAll(canvasTree, (n) => n.props && n.props['data-ps-task']).length, 0, 'a finished step must clear the banner')
+    assert.ok(eventSource && eventSource.url.includes('/api/events?deck=deck_next'), 'the canvas stays on the deck after the step')
+  } finally {
+    sessionTask = () => null
+    deckList = () => [{ id: 'deck_test', title: '画布渲染测试', slides: 1, sessionId: 'sess-1' }]
+  }
+})
+
+test('opening the tab later is not yanked by a call that already finished', async () => {
+  const session = 'sess-finished'
+  tabParams = { deckId: 'deck_test' }
+  sessionTask = () => ({
+    sessionId: session, tool: 'pptx_studio_slide', label: '绘制幻灯片', deckId: 'deck_prev',
+    state: 'done', message: '', startedAt: today(), updatedAt: today(), seq: 9,
+  })
+  try {
+    const before = fetches.length
+    await mountCanvas(session)
+    // The user opened the canvas to read a deck; the last call (already done)
+    // wrote another one — that must not drag the tab away.
+    assert.ok(fetches.slice(before).some((f) => f.url.includes('/api/state?deck=deck_test')), 'the tab keeps the deck it was opened on')
+    assert.ok(!fetches.slice(before).some((f) => f.url.includes('/api/state?deck=deck_prev')), 'a finished call must not steal the canvas')
+  } finally {
+    tabParams = {}
+    sessionTask = () => null
+  }
+})
+
+test('a call that is still running takes the canvas even when opened mid-run', async () => {
+  const session = 'sess-midrun'
+  tabParams = { deckId: 'deck_test' }
+  sessionTask = () => ({
+    sessionId: session, tool: 'pptx_studio_slide', label: '绘制幻灯片', deckId: 'deck_next',
+    state: 'running', message: '', startedAt: today(), updatedAt: today(), seq: 4,
+  })
+  try {
+    await mountCanvas(session)
+    for (let pass = 0; pass < 3; pass += 1) {
+      canvasTree = await rerender()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    assert.ok(fetches.some((f) => f.url.includes('/api/state?deck=deck_next')), 'a running call must take the canvas with it')
+    assert.ok(eventSource && eventSource.url.includes('/api/events?deck=deck_next'), 'the deck stream follows the running call')
+  } finally {
+    tabParams = {}
+    sessionTask = () => null
+  }
+})
+
+test('the tab title carries a live dot while a pptx step runs', async () => {
+  const session = 'sess-title'
+  sessionTask = () => ({
+    sessionId: session, tool: 'pptx_studio_slide', label: '绘制幻灯片', deckId: 'deck_x',
+    state: 'running', message: '', startedAt: today(), updatedAt: today(), seq: 1,
+  })
+  try {
+    resetRuntime()
+    /** @type {any} */
+    let titleComponent = null
+    module.apply({
+      ...ctx,
+      slots: {
+        inject: (name, body) => body(),
+        register: (spec, component) => { if (spec.name === 'sidebar.right.pane.tab.title') titleComponent = component; return { spec, component } },
+      },
+    })
+    assert.equal(typeof titleComponent, 'function')
+    const tree = await renderTree(titleComponent, { sessionId: session, t: (key) => String(key) })
+    const chip = findAll(tree, (n) => n.props && n.props['data-ps-tab-task'] !== undefined)[0]
+    assert.ok(chip, 'the tab title must expose its task state')
+    assert.equal(chip.props['data-ps-tab-task'], 'pptx_studio_slide', 'the tab title must name the running step')
+    assert.ok(findAll(tree, (n) => n.props && n.props.className === 'ps-tab-dot').length === 1, 'a live dot must mark the running tab')
+  } finally {
+    sessionTask = () => null
+  }
+})
+
+test('a stale pending flag (page reload) does not leave the canvas empty', async () => {
+  const session = 'sess-stale'
+  // The navigation params survive a reload; the call they belonged to does not.
+  tabParams = { pending: '1', nonce: String(Date.now() - 10 * 60_000) }
+  try {
+    await mountCanvas(session)
+    const root = findAll(canvasTree, (n) => n.props && n.props['data-ps-root'])[0]
+    assert.notEqual(root.props['data-ps-root'], 'pending', 'an expired pending call must not hold the shell empty')
+    assert.ok(fetches.some((f) => f.url.includes('/api/state?deck=deck_test')), 'the canvas falls back to the newest deck on disk')
+  } finally {
+    tabParams = {}
+  }
+})
+
+test('a running open call pulls an already-open tab off the previous deck', async () => {
+  const session = 'sess-open-running'
+  // The user opened the canvas earlier, so the tab is showing the previous build.
+  tabParams = { deckId: 'deck_prev' }
+  stateDelayMs = 80
+  sessionTask = () => ({
+    sessionId: session, tool: 'pptx_studio_open', label: '打开画布', deckId: '',
+    state: 'running', message: '', startedAt: today(), updatedAt: today(), seq: 1,
+  })
+  try {
+    await mountCanvas(session)
+    const root = findAll(canvasTree, (n) => n.props && n.props['data-ps-root'])[0]
+    assert.equal(root.props['data-ps-pending'], 'true', 'a new open must take the previous deck off screen')
+
+    // The slow `/api/state` for the old deck lands after the clear; it must not
+    // put the old pptx back on screen.
+    await new Promise((resolve) => setTimeout(resolve, 140))
+    for (let pass = 0; pass < 3; pass += 1) {
+      canvasTree = await rerender()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    }
+    const after = findAll(canvasTree, (n) => n.props && n.props['data-ps-root'])[0]
+    assert.equal(after.props['data-ps-pending'], 'true', 'a stale deck response must not resurrect the old pptx')
+    assert.ok(!treeText(canvasTree).includes('画布渲染测试'), 'the previous deck title must stay off screen')
+  } finally {
+    tabParams = {}
+    stateDelayMs = 0
+    sessionTask = () => null
+  }
+})
+
 test('while waiting for a deck the canvas keeps looking until one appears', async () => {
   deckList = () => []
   stateDeck = () => null
@@ -813,11 +1213,12 @@ test('the workflow strip opens the research brief and the sandboxed HTML preview
   try {
     await mountCanvas()
     const steps = findAll(canvasTree, (node) => node.props && node.props['data-ps-steps'])
-    assert.equal(steps.length, 1, 'a three-step workflow strip must render')
+    assert.equal(steps.length, 1, 'a four-step workflow strip must render')
     const stepButtons = findAll(canvasTree, (node) => node.props && node.props['data-ps-step'])
-    assert.deepEqual(stepButtons.map((node) => node.props['data-ps-step']), ['research', 'preview', 'build'])
-    assert.equal(stepButtons[0].props['data-done'], 'true', 'the research step is done in this deck')
-    assert.equal(stepButtons[1].props['data-done'], 'true', 'the HTML preview step is done in this deck')
+    assert.deepEqual(stepButtons.map((node) => node.props['data-ps-step']), ['template', 'research', 'preview', 'build'])
+    assert.equal(stepButtons[0].props['data-done'], 'false', 'a deck without a template leaves the ⓪ step pending')
+    assert.equal(stepButtons[1].props['data-done'], 'true', 'the research step is done in this deck')
+    assert.equal(stepButtons[2].props['data-done'], 'true', 'the HTML preview step is done in this deck')
 
     // Research panel: summary, audience and source links are all visible.
     findAll(canvasTree, (node) => node.props && node.props['data-ps-step'] === 'research')[0].props.onClick()
@@ -854,6 +1255,140 @@ test('the workflow strip opens the research brief and the sandboxed HTML preview
   } finally {
     stateDeck = () => HOST_DECK
   }
+})
+
+test('the workflow strip starts at ⓪ template and ticks it once the template is decomposed', async () => {
+  stateDeck = () => TEMPLATE_DECK
+  templateDoc = () => TEMPLATE_CATALOGUE
+  try {
+    await mountCanvas()
+    const stepButtons = findAll(canvasTree, (node) => node.props && node.props['data-ps-step'])
+    assert.deepEqual(stepButtons.map((node) => node.props['data-ps-step']), ['template', 'research', 'preview', 'build'],
+      '⓪ template must be the first step of the workflow strip')
+    assert.equal(stepButtons[0].props['data-done'], 'true', 'a decomposed template must tick the ⓪ step')
+    assert.equal(stepButtons[0].props['data-active'], 'false', 'the strip still lands on the slides once they exist')
+    assert.equal(stepButtons[1].props['data-done'], 'true', 'research done')
+
+    // Before `pptx_studio_template` ran the host reports stage=template and no
+    // decomposition: the canvas must open on the ⓪ panel with the step pending.
+    stateDeck = () => TEMPLATE_PENDING_DECK
+    templateDoc = () => null
+    const before = fetches.length
+    await mountCanvas()
+    const pendingSteps = findAll(canvasTree, (node) => node.props && node.props['data-ps-step'])
+    assert.equal(pendingSteps[0].props['data-done'], 'false', 'an undecomposed template must not tick the ⓪ step')
+    assert.equal(pendingSteps[0].props['data-active'], 'true', 'stage=template must open the ⓪ panel')
+    const pendingPanel = findAll(canvasTree, (node) => node.props && node.props['data-ps-panel'] === 'template')[0]
+    assert.ok(pendingPanel, 'the in-progress template panel must be on screen')
+    const badge = findAll(pendingPanel, (node) => node.props && node.props['data-ps-template-status'])[0]
+    assert.ok(badge, 'the template panel needs a status badge')
+    assert.equal(badge.props['data-ps-template-status'], 'current', 'undecomposed template reads as 进行中')
+    assert.ok(treeText(pendingPanel).includes('template.decomposingTitle'), 'the panel must say decomposition is running')
+    assert.equal(fetches.slice(before).some((f) => f.url.includes('/api/template')), false,
+      'no template catalogue may be requested before the host reports it decomposed')
+  } finally {
+    stateDeck = () => HOST_DECK
+    templateDoc = () => null
+  }
+})
+
+test('the template panel lists every page, its fillable fields and which pages this deck mapped', async () => {
+  stateDeck = () => TEMPLATE_DECK
+  templateDoc = () => TEMPLATE_CATALOGUE
+  try {
+    await mountCanvas()
+    const templateCall = fetches.find((f) => f.url.includes('/api/template'))
+    assert.ok(templateCall, 'the decomposed template must be fetched from /api/template')
+    assert.ok(templateCall.url.includes('deck=deck_test'), `template request must be deck-scoped; got ${templateCall.url}`)
+    assert.ok(templateCall.url.includes('sessionId=sess-1'), `template request must carry the session; got ${templateCall.url}`)
+
+    findAll(canvasTree, (node) => node.props && node.props['data-ps-step'] === 'template')[0].props.onClick()
+    canvasTree = await rerender()
+    const panel = findAll(canvasTree, (node) => node.props && node.props['data-ps-panel'] === 'template')[0]
+    assert.ok(panel, 'template panel missing')
+    assert.equal(findAll(panel, (node) => node.props && node.props['data-ps-template-status'])[0].props['data-ps-template-status'], 'done',
+      'a decomposed template reads as 已完成')
+
+    // Page cards: one per template page, role badge, thumbnail from the deck-scoped asset route.
+    const pageCards = findAll(panel, (node) => node.props && node.props['data-ps-template-page'] !== undefined)
+    assert.equal(pageCards.length, 3, 'every decomposed page needs a card')
+    assert.deepEqual(pageCards.map((node) => node.props['data-ps-template-page']), ['0', '1', '2'])
+    assert.deepEqual(pageCards.map((node) => node.props['data-ps-template-role']), ['cover', 'content', 'ending'])
+    const images = findAll(panel, (node) => node.props && typeof node.props.src === 'string' && node.props.src.includes('asset?'))
+    assert.equal(images.length, 3, 'each page card must render its plate thumbnail')
+    assert.ok(images[0].props.src.includes('deck=deck_test'), 'template thumbnails must be deck-scoped')
+    assert.ok(decodeURIComponent(images[0].props.src).includes('template/thumbs/s0.jpg'),
+      `a page thumbnail points at template/thumbs/sN.jpg; got ${images[0].props.src}`)
+
+    // Fields: id, sample and the ≤N 字 capacity.
+    const fieldNodes = findAll(panel, (node) => node.props && node.props['data-ps-template-field'])
+    assert.deepEqual(fieldNodes.map((node) => node.props['data-ps-template-field']), ['title', 'subtitle', 'heading', 'body', 'thanks'])
+    const caps = findAll(panel, (node) => node.props && node.props['data-ps-field-cap'])
+    assert.deepEqual(caps.map((node) => node.props['data-ps-field-cap']), ['18', '24', '14', '120', '8'])
+    const panelText = treeText(panel)
+    assert.ok(panelText.includes('2026 年度战略规划'), 'the field sample must render')
+    assert.ok(panelText.includes('上半年增长 18%'), 'a longer sample must render too')
+
+    // Design palette comes from design.palette (hex data, never hard-coded CSS).
+    const swatches = findAll(panel, (node) => node.props && node.props['data-ps-palette-hex'])
+    assert.deepEqual(swatches.map((node) => node.props['data-ps-palette-hex']), ['#0F172A', '#22D3EE', '#F59E0B'])
+
+    // The mapping highlights exactly the pages this deck uses, in deck order.
+    const mappedPages = pageCards
+      .filter((node) => node.props['data-ps-template-mapped'] === 'true')
+      .map((node) => node.props['data-ps-template-page'])
+    assert.deepEqual(mappedPages, ['0', '1'], 'only pages the deck mapped may be highlighted')
+    const mappingLabels = findAll(panel, (node) => node.props && node.props['data-ps-template-deck-page'])
+    assert.deepEqual(mappingLabels.map((node) => node.props['data-ps-template-deck-page']), ['1', '2'],
+      'a mapped template page names the deck page that uses it')
+    assert.ok(panelText.includes('title'), 'the mapped fields must be listed')
+  } finally {
+    stateDeck = () => HOST_DECK
+    templateDoc = () => null
+  }
+})
+
+test('a slide built on a template page shows a T{N} badge and names that page in the property panel', async () => {
+  stateDeck = () => TEMPLATE_DECK
+  templateDoc = () => TEMPLATE_CATALOGUE
+  try {
+    await mountCanvas()
+    const thumb = findAll(canvasTree, (node) => node.props && node.props['data-ps-thumb'] === '0')[0]
+    assert.ok(thumb, 'thumbnail missing')
+    const badge = findAll(thumb, (node) => node.props && node.props['data-ps-template-badge'])[0]
+    assert.ok(badge, 'a slide with templateSlide must carry a T{N} badge')
+    assert.equal(badge.props['data-ps-template-badge'], '1', 'the badge must name the template page')
+    assert.equal(badge.children[0], 'T1', 'the badge reads T{N}')
+    const stageBadge = findAll(canvasTree, (node) => node.props && node.props['data-ps-stage-template'])[0]
+    assert.equal(stageBadge && stageBadge.props['data-ps-stage-template'], '1', 'the editor head shows the same template page')
+
+    button(canvasTree, 'settings').props.onClick()
+    canvasTree = await rerender()
+    const row = findAll(canvasTree, (node) => node.props && node.props['data-ps-slide-template'])[0]
+    assert.ok(row, 'the property panel must report the template page')
+    assert.equal(row.props['data-ps-slide-template'], '1')
+    assert.ok(treeText(row).includes('template.fromSlide'), 'the row spells out “来自模板第 N 页”')
+    const goto = findAll(row, (node) => node.props && node.props['data-ps-btn'] === 'goto-template')[0]
+    assert.ok(goto, 'the property row links back to the template panel')
+    goto.props.onClick()
+    canvasTree = await rerender()
+    assert.ok(findAll(canvasTree, (node) => node.props && node.props['data-ps-panel'] === 'template').length > 0,
+      'the link must open the template panel')
+  } finally {
+    stateDeck = () => HOST_DECK
+    templateDoc = () => null
+  }
+})
+
+test('the template panel explains that a blank-mode deck has no template', async () => {
+  await mountCanvas()
+  findAll(canvasTree, (node) => node.props && node.props['data-ps-step'] === 'template')[0].props.onClick()
+  canvasTree = await rerender()
+  const panel = findAll(canvasTree, (node) => node.props && node.props['data-ps-panel'] === 'template')[0]
+  assert.ok(panel, 'the ⓪ panel must still open for decks without a template')
+  assert.equal(findAll(panel, (node) => node.props && node.props['data-ps-template-status'])[0].props['data-ps-template-status'], 'pending')
+  assert.ok(treeText(panel).includes('template.emptyTitle'), 'the panel must explain that a blank deck has no template')
+  assert.equal(findAll(panel, (node) => node.props && node.props['data-ps-template-page']).length, 0, 'no page cards without a template')
 })
 
 test('slide settings patch transition/notes and preview the transition effect', async () => {
@@ -1105,12 +1640,13 @@ test('the toolbar buttons are wired: export, download, add slide, undo/redo', as
   await mountCanvas()
   const exportButton = button(canvasTree, 'export')
   assert.ok(exportButton, 'export button missing')
+  assert.ok(button(canvasTree, 'download'), 'the download button must be there before any export')
   const before = fetches.length
   exportButton.props.onClick()
   await new Promise((resolve) => setTimeout(resolve, 10))
   assert.ok(fetches.slice(before).some((f) => f.url.includes('/api/export') && f.init && f.init.method === 'POST'), 'export button must POST /api/export')
   canvasTree = await rerender()
-  assert.ok(button(canvasTree, 'download'), 'a download button must appear once an export exists')
+  assert.ok(button(canvasTree, 'download'), 'the download button must survive an export')
 
   const addSlide = button(canvasTree, 'add-slide')
   assert.ok(addSlide, 'add-slide button missing')
@@ -1129,6 +1665,54 @@ test('the toolbar buttons are wired: export, download, add slide, undo/redo', as
   assert.ok(undo && redo, 'undo/redo buttons missing')
   assert.equal(undo.props.disabled, false, 'undo must enable after an edit')
   assert.equal(redo.props.disabled, true, 'redo must stay disabled until something is undone')
+})
+
+test('download asks the Host for a folder and exports into it', async () => {
+  const picks = []
+  uiWorkspace = {
+    pickDirectory: async () => {
+      picks.push('pick')
+      return 'D:/导出稿'
+    },
+  }
+  try {
+    await mountCanvas()
+    const before = fetches.filter((f) => f.url.includes('/api/export')).length
+    button(canvasTree, 'download').props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.equal(picks.length, 1, 'download must open the Host directory picker')
+    const call = fetches.filter((f) => f.url.includes('/api/export'))[before]
+    assert.ok(call, 'download must POST /api/export')
+    assert.equal(JSON.parse(call.init.body).dir, 'D:/导出稿', 'the export must carry the picked folder')
+    assert.equal(JSON.parse(call.init.body).path, undefined, 'the folder, not a workspace path, is what download sends')
+  } finally {
+    uiWorkspace = null
+  }
+})
+
+test('a cancelled folder picker exports nothing', async () => {
+  uiWorkspace = { pickDirectory: async () => null }
+  try {
+    await mountCanvas()
+    const before = fetches.filter((f) => f.url.includes('/api/export')).length
+    button(canvasTree, 'download').props.onClick()
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assert.equal(fetches.filter((f) => f.url.includes('/api/export')).length, before,
+      'cancelling the picker must not export anything')
+  } finally {
+    uiWorkspace = null
+  }
+})
+
+test('without a Host picker the download falls back to the browser channel', async () => {
+  uiWorkspace = null
+  await mountCanvas()
+  anchorClicks.length = 0
+  button(canvasTree, 'download').props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(anchorClicks.length, 1, 'the fallback must hand one blob URL to the browser')
+  assert.match(anchorClicks[0].href, /^blob:/, 'the fallback anchor must point at a blob URL')
+  assert.match(anchorClicks[0].download, /\.pptx$/, 'the fallback anchor must carry a .pptx name')
 })
 
 test('the deck delete button arms itself before it deletes', async () => {
@@ -1196,58 +1780,139 @@ test('selecting an element, typing a note and sending reaches the session path',
   assert.equal(body.elementId, 'e1', 'feedback must name the element the user pointed at')
 })
 
-test('the tool card opens the canvas as soon as the call starts', async () => {
-  /** @type {any} */
-  let card = null
+test('every pptx tool card switches the canvas to the deck it writes, at call time', async () => {
+  /** @type {Map<string, any>} */
+  const cards = new Map()
   const captureCtx = {
     ...ctx,
     slots: {
       inject: (name, body) => body(),
-      register: (spec, component) => { if (spec.name === 'tool.call.toolview') card = component; return { spec, component } },
+      register: (spec, component) => {
+        if (spec.name === 'tool.call.toolview') cards.set(spec.key, component)
+        return { spec, component }
+      },
     },
   }
   module.apply(captureCtx)
-  assert.equal(typeof card, 'function')
+  assert.equal(cards.size, 12, 'each tool needs its own card, keyed by wire name')
+
+  // The harness translator returns keys; give it the two templates the card
+  // interpolates so a failed call can be held against the host message.
+  const dict = {
+    'card.failed': '这一步失败了：{message}',
+    'card.slides': '{count} 页',
+  }
+  const translate = (key, values) => {
+    const template = dict[String(key)] ?? String(key)
+    return values ? template.replace(/\{(\w+)\}/g, (_, name) => String(values[name] ?? '')) : template
+  }
+
   /**
-   * Render the card to a settled tree with a fresh hook runtime.
-   * @param {string} phase - tool phase.
-   * @param {() => boolean} [openStudio] - opener stub.
-   * @returns {Promise<{tree: any, opens: () => number}>} tree and open count.
+   * Render one card with a fresh hook runtime.
+   * @param {any} component - card component.
+   * @param {Record<string, any>} options - phase/toolName/args/result/opener.
+   * @returns {Promise<{tree: any, opens: any[]}>} tree and the params handed to the opener.
    */
-  const renderCard = async (phase, openStudio) => {
+  const renderCard = async (component, options) => {
     resetRuntime()
-    let opens = 0
-    const tree = await renderTree(card, {
-      phase,
+    /** @type {any[]} */
+    const opens = []
+    const openStudio = options.openStudio || ((params) => { opens.push(params); return true })
+    const tree = await renderTree(component, {
+      phase: options.phase,
       callId: 'call-1',
       sessionId: 'sess-1',
-      toolName: 'pptx_studio_open',
-      t: (key) => String(key),
-      block: { args: { text: (key) => (key === 'title' ? '测试 deck' : key === 'template' ? '' : undefined) } },
-      openStudio: openStudio || (() => { opens += 1; return true }),
+      toolName: options.toolName,
+      t: translate,
+      block: {
+        args: { text: (key) => (options.args ? options.args[key] : undefined) },
+        result: options.result === undefined ? undefined : { value: options.result },
+      },
+      openStudio,
     })
-    return { tree, opens: () => opens }
+    return { tree, opens }
   }
   const flatten = (tree) => JSON.stringify(tree, (key, value) => (typeof value === 'function' ? 'fn' : value))
 
-  // The regression this guards: opening only on `result` means the user stares
-  // at the conversation while the deck is drawn behind a closed tab, and then
-  // finds a finished file. The canvas must show up with the call itself.
-  const started = await renderCard('start')
-  assert.equal(started.opens(), 1, 'the card must open the canvas while the call is still running')
-  assert.ok(flatten(started.tree).includes('测试 deck'), 'card must show the deck title from the tool args')
-  assert.ok(flatten(started.tree).includes('card.live'), 'a running card must say the canvas is following the build')
+  // `pptx_studio_open` has no deck while it streams its arguments: the canvas is
+  // opened as *pending*, so it shows this call's progress instead of loading the
+  // previous build's deck.
+  const openCard = cards.get('pptx_studio_open')
+  const openPreparing = await renderCard(openCard, { phase: 'preparing', toolName: 'pptx_studio_open', args: { title: '测试 deck' } })
+  assert.equal(openPreparing.opens.length, 1, 'the open card must open the canvas while the call is still preparing')
+  assert.equal(openPreparing.opens[0].pending, '1', 'a brand-new open has no deck yet: the tab must open pending')
+  assert.ok(flatten(openPreparing.tree).includes('测试 deck'), 'the card must show the title from the tool args')
+  assert.ok(flatten(openPreparing.tree).includes('card.live'), 'a running card must say the canvas is following the build')
 
-  const preparing = await renderCard('preparing')
-  assert.equal(preparing.opens(), 1, 'the preparing phase (arguments still streaming) must open it too')
+  // The deck only exists after the call ran: the tab that opened pending is
+  // navigated to it, so the canvas does not sit on the previous pptx.
+  const openDone = await renderCard(openCard, {
+    phase: 'result',
+    toolName: 'pptx_studio_open',
+    args: { title: '测试 deck' },
+    result: { ok: true, deckId: 'deck_fresh', slides: 0 },
+  })
+  assert.equal(openDone.opens.length, 0, 'a card that mounts on an old result must not steal focus')
+
+  // The live transition (same card instance) is what navigates: render the
+  // call while running, then hand the receipt to the same hook runtime.
+  resetRuntime()
+  /** @type {any[]} */
+  const navOpens = []
+  const liveProps = (phase, result) => ({
+    phase,
+    callId: 'call-live',
+    sessionId: 'sess-1',
+    toolName: 'pptx_studio_open',
+    t: translate,
+    block: { args: { text: () => '' }, result: result === undefined ? undefined : { value: result } },
+    openStudio: (params) => { navOpens.push(params); return true },
+  })
+  await renderTree(openCard, liveProps('start'))
+  await renderTree(openCard, liveProps('result', { ok: true, deckId: 'deck_fresh', slides: 0 }))
+  assert.equal(navOpens.length, 2, 'the call opens the tab, then navigates it to the deck it created')
+  assert.equal(navOpens[1].deckId, 'deck_fresh', 'the tab must be pointed at the new deck')
+
+  // Every other step names its deck in the arguments — the canvas must switch
+  // before the tool even runs, not after it returns.
+  for (const key of ['pptx_studio_plan', 'pptx_studio_slide', 'pptx_studio_research', 'pptx_studio_preview', 'pptx_studio_export']) {
+    const card = cards.get(key)
+    const rendered = await renderCard(card, { phase: 'preparing', toolName: key, args: { deck: 'deck_current' } })
+    assert.equal(rendered.opens.length, 1, `${key} must switch the canvas at call time`)
+    assert.equal(rendered.opens[0].deckId, 'deck_current', `${key} must point the tab at the deck from its args`)
+  }
+
+  // Arguments stream in: the deck may only appear after the first render.
+  const planCard = cards.get('pptx_studio_plan')
+  resetRuntime()
+  /** @type {any[]} */
+  const streamed = []
+  const streamProps = (args) => ({
+    phase: 'preparing',
+    callId: 'call-stream',
+    sessionId: 'sess-1',
+    toolName: 'pptx_studio_plan',
+    t: translate,
+    block: { args: { text: (key) => args[key] } },
+    openStudio: (params) => { streamed.push(params); return true },
+  })
+  await renderTree(planCard, streamProps({}))
+  await renderTree(planCard, streamProps({ deck: 'deck_streamed' }))
+  assert.equal(streamed.length, 2, 'a deck that streams in late must still be navigated to')
+  assert.equal(streamed[1].deckId, 'deck_streamed')
 
   // A sidebar that is not mounted yet must say so instead of pretending.
-  const blocked = await renderCard('start', () => false)
+  const blocked = await renderCard(openCard, { phase: 'start', toolName: 'pptx_studio_open', args: { title: 'x' }, openStudio: () => false })
   assert.ok(flatten(blocked.tree).includes('card.opening'), 'a running card that failed to open must say it is opening')
 
-  const finished = await renderCard('result')
-  assert.equal(finished.opens(), 1, 'the result phase must still open the canvas when it is the first render')
-  assert.ok(flatten(finished.tree).includes('card.opened'), 'a finished card must confirm the canvas is open')
+  // A failed step must report the reason on the card.
+  const failed = await renderCard(cards.get('pptx_studio_export'), {
+    phase: 'result',
+    toolName: 'pptx_studio_export',
+    args: { deck: 'deck_x' },
+    result: { ok: false, code: 'stage-build', message: '还没有幻灯片' },
+  })
+  assert.ok(flatten(failed.tree).includes('还没有幻灯片'), 'a failed call must show the host message')
 })
 
 test('the opener refuses to open the canvas without a mounted session', () => {
@@ -1274,6 +1939,109 @@ test('the opener refuses to open the canvas without a mounted session', () => {
   assert.equal(typeof inject, 'function')
   const props = inject('sess-1')
   assert.equal(props.openStudio({ deckId: 'x' }), false, 'opener must fail closed with no session on screen')
+})
+
+test('the opener focuses the existing canvas tab before opening it again', () => {
+  /** @type {any} */
+  let inject = null
+  /** @type {string[]} */
+  const order = []
+  const captureCtx = {
+    ...ctx,
+    slots: {
+      inject: (name, body) => { if (name === 'tool.call.toolview') { const registered = body(); inject = registered.spec.inject } return () => {} },
+      register: (spec, component) => ({ spec, component }),
+    },
+    get: (name) => {
+      if (name !== 'sidebarRight') return undefined
+      return {
+        mounted: { getSnapshot: () => 'sess-1' },
+        active: () => ({ id: 'tab-other', kind: 'someone-else' }),
+        tabsIn: (sessionId) => (sessionId === 'sess-1' ? [{ id: 'tab-canvas', kind: 'pptx-studio-canvas' }] : []),
+        focus: (tabId) => { order.push(`focus:${tabId}`) },
+        openTab: (kind, options) => { order.push(`open:${kind}:${JSON.stringify(options?.params || {})}`) },
+      }
+    },
+  }
+  module.apply(captureCtx)
+  const props = inject('sess-1')
+  assert.equal(props.openStudio({ deckId: 'deck_next' }), true)
+  // A split sidebar may already hold the canvas in another pane; focusing it
+  // first keeps `openTab` from adding a second canvas tab beside it.
+  assert.deepEqual(order, [
+    'focus:tab-canvas',
+    'open:pptx-studio-canvas:{"deckId":"deck_next"}',
+  ])
+})
+
+/**
+ * Deck exercising the chart kinds, so the canvas approximation can be held
+ * against the exported chart part (pptx_build.py#add_chart / #theme_chart):
+ * the design-sheet style (axis:"none", gradient, data labels, corner) plus the
+ * default look (value axis, bottom legend, pie value labels).
+ */
+const CHART_DECK = {
+  ...HOST_DECK,
+  id: 'deck_charts',
+  slides: [{
+    id: 's1', title: '图表页',
+    background: { color: '#0F172A' },
+    elements: [
+      { id: 'col', type: 'chart', box: [0.8, 0.6, 7.6, 4.3], chart: { kind: 'column', categories: ['周一', '周二', '周三'], axis: 'none', gradient: ['#22D3EE', '#0E7490'], dataLabels: true, corner: 0.1, series: [{ name: '完成量', values: [55, 72, 48], color: '#22D3EE' }] } },
+      { id: 'multi', type: 'chart', box: [0.8, 5, 6, 2], chart: { kind: 'column', categories: ['A', 'B'], series: [{ name: '上半年', values: [3, 5] }, { name: '下半年', values: [4, 2] }] } },
+      { id: 'pie', type: 'chart', box: [8.6, 0.6, 4, 3], chart: { kind: 'pie', categories: ['甲', '乙'], series: [{ name: '占比', values: [30, 70] }] } },
+    ],
+  }],
+}
+
+/**
+ * Visible text of a node: children only, never the serialised props (a
+ * category name parked in a title attribute must not count as a label).
+ * @param {any} node - node.
+ * @returns {string} text.
+ */
+function visibleText(node) {
+  if (node === null || node === undefined || node === false) return ''
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  return (node.children || []).map(visibleText).join(' ')
+}
+
+test('the canvas chart mirrors the design sheet: bare bars, gradient, value labels', async () => {
+  stateDeck = () => CHART_DECK
+  try {
+    await mountCanvas()
+    const canvas = findAll(canvasTree, (node) => node.props && node.props['data-ps-canvas'])[0]
+    const chartEl = (id) => {
+      const el = findAll(canvas, (node) => node.props && node.props.className === 'ps-el' && node.props['data-id'] === id)[0]
+      assert.ok(el, `${id} chart element missing`)
+      return el
+    }
+    const col = visibleText(chartEl('col'))
+    assert.ok(!col.includes('完成量'), 'the auto title stays hidden (autoTitleDeleted=1); only an explicit title shows')
+    assert.ok(col.includes('55') && col.includes('48'), 'axis:"none" charts carry the numbers as data labels, like the export')
+    assert.ok(col.includes('周一'), 'category labels must stay')
+    const ticks = findAll(chartEl('col'), (node) => node.props && node.props.style && node.props.style.lineHeight === 1 && typeof (node.children || [])[0] === 'string')
+      .map((node) => node.children[0])
+    assert.deepEqual(ticks, [], 'axis:"none" must draw no value axis ticks')
+    const bar = findAll(chartEl('col'), (node) => node.props && node.props.style && typeof node.props.style.background === 'string' && node.props.style.background.includes('linear-gradient'))[0]
+    assert.ok(bar, 'the gradient from the design sheet must reach the bar')
+    assert.match(bar.props.style.background, /22D3EE/i, 'gradient starts at the sheet colour')
+    assert.match(bar.props.style.background, /0E7490/i, 'gradient ends at the sheet colour')
+    assert.equal(bar.props.style.borderRadius, '10% 10% 0 0', 'the rounded corner must reach the bar')
+    // The default look still holds for charts without the design-sheet style.
+    const multi = visibleText(chartEl('multi'))
+    assert.ok(multi.includes('上半年') && multi.includes('下半年'), 'multi-series charts carry a bottom legend in the export; the canvas must too')
+    const multiTicks = findAll(chartEl('multi'), (node) => node.props && node.props.style && node.props.style.lineHeight === 1 && typeof (node.children || [])[0] === 'string')
+      .map((node) => node.children[0])
+    assert.deepEqual(multiTicks, ['6', '4', '2', '0'], 'charts without axis:"none" keep the automatic value axis')
+    const pie = visibleText(chartEl('pie'))
+    assert.ok(pie.includes('30') && pie.includes('70'), 'pie/doughnut data labels show values, like the export')
+    assert.ok(!pie.includes('甲') && !pie.includes('乙'), 'pie labels show values only, not category names')
+    const surfaceInk = findAll(chartEl('col'), (node) => node.props && node.props.style && node.props.style.color === '#F1F5F9')
+    assert.ok(surfaceInk.length > 0, 'on a dark slide the chart ink must follow the theme surface colour')
+  } finally {
+    stateDeck = () => HOST_DECK
+  }
 })
 
 await Promise.all(pending)

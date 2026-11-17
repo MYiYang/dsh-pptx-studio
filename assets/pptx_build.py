@@ -19,13 +19,14 @@ Beyond plain shapes this writer emits the features a .pptx is expected to have:
   - native charts              -> python-pptx chart parts
 """
 import json
+import math
 import os
 import sys
 
 from pptx import Presentation
 from pptx.chart.data import CategoryChartData
 from pptx.dml.color import RGBColor
-from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
+from pptx.enum.chart import XL_CHART_TYPE, XL_LABEL_POSITION, XL_LEGEND_POSITION
 from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.oxml import parse_xml
@@ -39,6 +40,7 @@ THEME_INK = "0F172A"
 THEME_MUTED = "64748B"
 THEME_ACCENT = "2563EB"
 THEME_SURFACE = "F1F5F9"
+THEME_BACKGROUND = "FFFFFF"
 
 TRANSITION_TYPES = {
     "fade": "<p:fade/>",
@@ -340,6 +342,192 @@ def add_table(slide, el):
     return shape
 
 
+# CT_ChartSpace child order (ECMA-376 part 1, 21.2.2.29): spPr must sit
+# between c:chart and c:txPr or PowerPoint rejects the chart part.
+_CHART_SPACE_ORDER = (
+    "c:date1904", "c:lang", "c:roundedCorners", "c:style", "c:clrMapOvr",
+    "c:pivotSource", "c:protection", "c:chart", "c:spPr", "c:txPr",
+    "c:externalData", "c:printSettings", "c:userShapes", "c:extLst",
+)
+
+
+def axis_scale(numbers):
+    """Nice round value-axis bounds covering the data.
+
+    The canvas draws the very same scale (client.js#axisScale), so pinning the
+    exported chart to it is what keeps the file and the preview identical —
+    PowerPoint's own automatic axis would pick different bounds and the bars
+    would land at different heights on the two sides.
+    @param {list[float]} numbers - every data point of the chart.
+    @returns {tuple} (bottom, top, step, ticks).
+    """
+    flat = [float(n) for n in (numbers or []) if n is not None]
+    if not flat:
+        flat = [0.0]
+    lo = min(0.0, min(flat))
+    hi = max(1.0, max(flat))
+    span = hi - lo or 1.0
+    raw = span / 4.0
+    mag = 10.0 ** math.floor(math.log10(raw)) if raw > 0 else 1.0
+    norm = raw / mag
+    step = (1 if norm <= 1 else 2 if norm <= 2 else 2.5 if norm <= 2.5 else 5 if norm <= 5 else 10) * mag
+    bottom = math.floor(lo / step) * step
+    top = math.ceil(hi / step) * step
+    ticks = []
+    value = bottom
+    while value <= top + step / 2.0:
+        ticks.append(round(value, 3))
+        value += step
+    return bottom, top, step, ticks
+
+
+def _luma(hex_text):
+    """Rough perceptual brightness (0-255) of an #RRGGBB colour."""
+    value = str(hex_text or "").strip().lstrip("#")
+    if len(value) == 3:
+        value = "".join(c * 2 for c in value)
+    if len(value) < 6:
+        return 255
+    try:
+        r, g, b = int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+    except ValueError:
+        return 255
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _slide_bg_hex(slide):
+    """The slide's own background colour, falling back to the deck theme."""
+    try:
+        rgb = slide.background.fill.fore_color.rgb
+        if rgb is not None:
+            return str(rgb)
+    except Exception:
+        pass
+    return THEME_BACKGROUND
+
+
+def _transparent_spPr(parent, order=None):
+    """Give a chart part a transparent fill; order keeps OOXML schema-valid."""
+    existing = parent.find(qn("c:spPr"))
+    if existing is not None:
+        parent.remove(existing)
+    spPr = parse_xml('<c:spPr %s><a:noFill/><a:ln><a:noFill/></a:ln></c:spPr>' % nsdecls("c", "a"))
+    if order:
+        tags = [qn(tag) for tag in order]
+        pos = tags.index(qn("c:spPr"))
+        for child in parent:
+            if child.tag in tags and tags.index(child.tag) > pos:
+                child.addprevious(spPr)
+                break
+        else:
+            parent.append(spPr)
+    else:
+        parent.append(spPr)
+    return spPr
+
+
+def _rounded_bars(series, corner):
+    """Round the top of a column/bar series (prstGeom roundRect on the series).
+
+    prstGeom must precede the fill inside c:spPr, so it goes in first.
+    """
+    adj = int(max(0.0, min(0.5, float(corner))) * 100000)
+    spPr = series._element.get_or_add_spPr()
+    for tag in ("a:prstGeom", "a:custGeom"):
+        old = spPr.find(qn(tag))
+        if old is not None:
+            spPr.remove(old)
+    spPr.insert(0, parse_xml('<a:prstGeom %s prst="roundRect"><a:avLst><a:gd name="adj" fmla="val %d"/></a:avLst></a:prstGeom>' % (nsdecls("a"), adj)))
+
+
+def _hide_axes(chart):
+    """Drop both axes, the gridlines and the auto title: a design sheet that
+    draws bare bars with value labels on top, no ruler around them."""
+    try:
+        for axis in (chart.category_axis, chart.value_axis):
+            axis.visible = False
+        chart.value_axis.has_major_gridlines = False
+    except Exception:
+        pass
+    try:
+        chart_el = chart._chartSpace.find(qn("c:chart"))
+        auto = chart_el.find(qn("c:autoTitleDeleted"))
+        if auto is None:
+            auto = parse_xml('<c:autoTitleDeleted %s val="1"/>' % nsdecls("c"))
+            plot_area = chart_el.find(qn("c:plotArea"))
+            if plot_area is not None:
+                plot_area.addprevious(auto)
+            else:
+                chart_el.append(auto)
+        else:
+            auto.set("val", "1")
+    except Exception:
+        pass
+
+
+def theme_chart(chart, slide, kind, hide_axes=False):
+    """Bend a native chart onto the deck theme.
+
+    python-pptx charts arrive Office-default: black text, white chart space,
+    theme-grid grey gridlines. On a dark slide that is a bright hole with
+    invisible labels, so here the chart space and plot area go transparent,
+    and text / axis / gridline colours follow the deck theme (light ink on a
+    dark slide, dark ink on a light one).
+    """
+    dark = _luma(_slide_bg_hex(slide)) < 110
+    text_hex = THEME_SURFACE if dark else THEME_INK
+    axis_hex = THEME_MUTED
+    try:
+        chart.font.color.rgb = hexcolor(text_hex)
+    except Exception:
+        pass
+    try:
+        _transparent_spPr(chart._chartSpace, _CHART_SPACE_ORDER)
+    except Exception:
+        pass
+    try:
+        plot_area = chart.plots[0]._element.getparent()
+        _transparent_spPr(plot_area)
+    except Exception:
+        pass
+    if kind in (XL_CHART_TYPE.PIE, XL_CHART_TYPE.DOUGHNUT):
+        try:
+            chart.plots[0].data_labels.font.color.rgb = hexcolor(text_hex)
+        except Exception:
+            pass
+    elif not hide_axes:
+        for axis in (chart.category_axis, chart.value_axis):
+            try:
+                axis.tick_labels.font.color.rgb = hexcolor(text_hex)
+                axis.format.line.color.rgb = hexcolor(axis_hex)
+            except Exception:
+                pass
+        try:
+            value_axis = chart.value_axis
+            value_axis.has_major_gridlines = True
+            value_axis.major_gridlines.format.line.color.rgb = hexcolor(axis_hex)
+        except Exception:
+            pass
+    else:
+        # Data labels on an axis-less chart carry the numbers the ruler would.
+        try:
+            chart.plots[0].data_labels.font.color.rgb = hexcolor(text_hex)
+        except Exception:
+            pass
+    if chart.has_title:
+        try:
+            for para in chart.chart_title.text_frame.paragraphs:
+                for run in para.runs:
+                    run.font.color.rgb = hexcolor(text_hex)
+        except Exception:
+            pass
+    if chart.has_legend:
+        try:
+            chart.legend.font.color.rgb = hexcolor(text_hex)
+        except Exception:
+            pass
+
+
 def add_chart(slide, el):
     """Native, editable chart part (bar / line / pie / doughnut / area)."""
     left, top, width, height = emu_box(el)
@@ -396,33 +584,65 @@ def add_chart(slide, el):
             plot.gap_width = 60
         except Exception:
             pass
+        if model.get("dataLabels") is True:
+            try:
+                plot.has_data_labels = True
+                plot.data_labels.position = XL_LABEL_POSITION.OUTSIDE_END
+            except Exception:
+                pass
+
+    # axis:"none" = bare bars with value labels, the design-sheet look.
+    hide_axes = str(model.get("axis") or "auto") == "none"
+    if hide_axes:
+        _hide_axes(chart)
 
     palette = [THEME_ACCENT, "0EA5E9", "10B981", "F59E0B", "EF4444", "8B5CF6"]
+    gradient = model.get("gradient")
+    if not (isinstance(gradient, list) and len(gradient) >= 2):
+        gradient = None
+    corner = model.get("corner")
+    if not isinstance(corner, (int, float)):
+        corner = None
     for index, series_model in enumerate(series_list):
         if index >= len(chart.series):
             break
         series = chart.series[index]
         color = series_model.get("color")
-        if color:
-            try:
-                if kind in (XL_CHART_TYPE.PIE, XL_CHART_TYPE.DOUGHNUT):
-                    for point in series.points:
-                        point.format.fill.solid()
-                        point.format.fill.fore_color.rgb = hexcolor(color)
-                elif kind == XL_CHART_TYPE.LINE_MARKERS:
-                    series.format.line.color.rgb = hexcolor(color)
-                else:
-                    series.format.fill.solid()
-                    series.format.fill.fore_color.rgb = hexcolor(color)
-            except Exception:
-                pass
-        elif kind in (XL_CHART_TYPE.PIE, XL_CHART_TYPE.DOUGHNUT):
-            try:
+        try:
+            if kind in (XL_CHART_TYPE.PIE, XL_CHART_TYPE.DOUGHNUT):
                 for i, point in enumerate(series.points):
                     point.format.fill.solid()
-                    point.format.fill.fore_color.rgb = hexcolor(palette[i % len(palette)])
-            except Exception:
-                pass
+                    point.format.fill.fore_color.rgb = hexcolor(color or palette[i % len(palette)])
+            elif kind == XL_CHART_TYPE.LINE_MARKERS:
+                series.format.line.color.rgb = hexcolor(color or THEME_ACCENT)
+            elif gradient:
+                fill = series.format.fill
+                fill.gradient()
+                fill.gradient_angle = 90.0  # top -> bottom, like the CSS sheet
+                stops = fill.gradient_stops
+                stops[0].color.rgb = hexcolor(gradient[0])
+                stops[0].position = 0.0
+                stops[-1].color.rgb = hexcolor(gradient[1])
+                stops[-1].position = 1.0
+            else:
+                series.format.fill.solid()
+                series.format.fill.fore_color.rgb = hexcolor(color or THEME_ACCENT)
+        except Exception:
+            pass
+        if corner is not None and kind not in (XL_CHART_TYPE.PIE, XL_CHART_TYPE.DOUGHNUT, XL_CHART_TYPE.LINE_MARKERS):
+            _rounded_bars(series, corner)
+    # Pin the value axis to the canvas scale (client.js#axisScale) so the
+    # exported bars stand at exactly the heights the preview shows.
+    if kind not in (XL_CHART_TYPE.PIE, XL_CHART_TYPE.DOUGHNUT):
+        numbers = [float(v) for one in series_list for v in (one.get("values") or [])]
+        bottom, top, step, _ticks = axis_scale(numbers)
+        try:
+            chart.value_axis.minimum_scale = bottom
+            chart.value_axis.maximum_scale = top
+            chart.value_axis.major_unit = step
+        except Exception:
+            pass
+    theme_chart(chart, slide, kind, hide_axes)
     return frame
 
 
@@ -579,7 +799,10 @@ def apply_background(slide, background):
 
 
 def build(deck_path, out_path, template=None, effects=True):
-    global FONT, THEME_INK, THEME_MUTED, THEME_ACCENT, THEME_SURFACE
+    global FONT, THEME_INK, THEME_MUTED, THEME_ACCENT, THEME_SURFACE, THEME_BACKGROUND
+    # Anything that fails to render is a data problem the caller must see: the
+    # old code only wrote it to stderr, where the tool receipt never looked.
+    failures = []
     with open(deck_path, encoding="utf-8") as fh:
         deck = json.load(fh)
 
@@ -591,6 +814,7 @@ def build(deck_path, out_path, template=None, effects=True):
     THEME_MUTED = str(colors.get("muted") or THEME_MUTED).lstrip("#")
     THEME_ACCENT = str(colors.get("accent") or THEME_ACCENT).lstrip("#")
     THEME_SURFACE = str(colors.get("surface") or THEME_SURFACE).lstrip("#")
+    THEME_BACKGROUND = str(colors.get("background") or THEME_BACKGROUND).lstrip("#")
 
     if template:
         prs = Presentation(template)
@@ -632,7 +856,9 @@ def build(deck_path, out_path, template=None, effects=True):
                 else:
                     shape = builder(slide, el)
             except Exception as exc:  # one bad element must not kill the deck
-                sys.stderr.write("element %s failed: %s\n" % (el.get("id"), exc))
+                line = "element %s failed: %s" % (el.get("id"), exc)
+                sys.stderr.write(line + "\n")
+                failures.append(line)
                 shape = add_placeholder(slide, {**el, "text": "render error"})
             shape_ids.append(getattr(shape, "shape_id", None))
 
@@ -641,7 +867,9 @@ def build(deck_path, out_path, template=None, effects=True):
             try:
                 slide.notes_slide.notes_text_frame.text = notes
             except Exception as exc:
-                sys.stderr.write("notes failed: %s\n" % exc)
+                line = "notes failed: %s" % exc
+                sys.stderr.write(line + "\n")
+                failures.append(line)
 
         if effects:
             transition = slide_model.get("transition")
@@ -649,13 +877,17 @@ def build(deck_path, out_path, template=None, effects=True):
                 try:
                     slide._element.append(parse_xml(transition_xml(transition)))
                 except Exception as exc:
-                    sys.stderr.write("transition failed: %s\n" % exc)
+                    line = "transition failed: %s" % exc
+                    sys.stderr.write(line + "\n")
+                    failures.append(line)
             timing = animation_xml(slide_model, shape_ids)
             if timing:
                 try:
                     slide._element.append(parse_xml(timing))
                 except Exception as exc:
-                    sys.stderr.write("timing failed: %s\n" % exc)
+                    line = "timing failed: %s" % exc
+                    sys.stderr.write(line + "\n")
+                    failures.append(line)
 
     title = str(deck.get("title") or "deck")
     prs.core_properties.title = title
@@ -704,6 +936,8 @@ def build(deck_path, out_path, template=None, effects=True):
             "charts": charts,
         },
     }
+    if failures:
+        result["warnings"] = failures
     print(json.dumps(result, ensure_ascii=False))
     return result
 

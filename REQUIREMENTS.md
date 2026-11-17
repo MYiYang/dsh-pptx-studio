@@ -35,8 +35,17 @@
    - 元素级渲染：文本、矩形、图片、线条、表格占位、图表占位；坐标系与 PowerPoint 一致（英寸/pt，16:9 13.333×7.5in）。
    - 支持缩放（适应宽度/100%）、翻页、全屏。
 2. **绘制过程可见（不是「跑完突然出现」）**
-   - **打开时机**：`pptx_studio_open` 的工具卡片在 `preparing`/`start` 阶段就打开右侧画布，不等工具返回；
-     结果带回 `deckId` 后再把已打开的 tab 导航到这份 deck（换 build 时不会继续显示上一份）。
+   - **打开时机（所有步骤，不只是 open）**：12 个 `pptx_studio_*` 工具各注册一张 `tool.call.toolview` 卡片，
+     在 `preparing`/`start` 阶段就 `openTab` 把右侧画布打开并切到前台，不等工具返回。带 `deck` 参数的步骤
+     （模板/调研/预览/大纲/写页/改元素/校验/导出）直接按参数里的 deck 导航；`pptx_studio_open` 还不知道新 deck，
+     就以 `pending` 方式打开，画布渲染该次调用的等待骨架（工具名 + 耗时），**不加载最近一次落盘的旧 deck**；
+     结果带回 `deckId` 后再把已打开的 tab 导航过去。
+   - **会话级进度流**：宿主把每次调用的 `{tool, deckId, state, startedAt, seq}` 发布到
+     `GET /api/session?sessionId=`（快照）与 `GET /api/session/events?sessionId=`（SSE）。画布订阅它：
+     deck 一变就切（工具卡片已经被卸载也一样）；`open` 在 running 且无 deck 时先把上一份 deck 移出屏幕；
+     顶部显示「正在〈某步〉… deck: xxx Ns」，页签标题出现呼吸圆点。
+   - **不会退回旧 deck**：`/state` 响应回来时比对当前 `deckId`，过期的响应直接丢弃；`pending` 参数带时间戳，
+     页面刷新后的过期 pending 自动失效（否则会把画布卡死在空态）。
    - **没有 deck 时也有编辑区**：画布渲染完整的编辑区/功能区 shell（纸面骨架 + 3 个灰色缩略图占位 +
      分隔条），而不是一句空提示；Agent 一开画，内容就在已经存在的编辑区里生长，不挤压、不跳位。
    - **逐页**：`pptx_studio_plan` 先发 `planning` 状态（「正在摆放 N 页骨架」），再每 160ms 落一页骨架；
@@ -166,7 +175,6 @@ SSE 事件：
 | `pptx_studio_patch` | 局部改元素（模型最常用） | `deck`, `slideId`, `elementId`, `patch` |
 | `pptx_studio_inspect` | 读回当前 deck（供模型自检/续写） | `deck`, `slideId?` |
 | `pptx_studio_export` | 立即导出 pptx 并返回路径/字节数 | `deck`, `path?` |
-| `pptx_studio_finish` | 收尾：导出 + 状态置完成 | `deck`, `path?` |
 
 反馈消息（发给会话的用户消息模板）：
 
@@ -388,7 +396,7 @@ SSE 事件：
 
 ### 11.4 验收标准
 
-1. `npm test` 全绿（model 23 / store 7 / python 4 / skills 14 / e2e 20 / client 25 = 93）。
+1. `npm test` 全绿（model 26 / template 27 / store 7 / python 7 / skills 14 / e2e 29 / client 30 = 140）。
 2. 禁用再启用 `include:dsh-pptx-studio` 后，本会话技能表里出现 `pptx-studio`；再禁用则消失（证明注册挂在插件 fiber 上）。
 3. `skill` 工具能加载 `pptx-studio`，返回正文与 `resourceBase` 目录。
 4. 新会话只给「生成一个充满科技感风格的 ppt」：首个制作动作是 `pptx_studio_open`，全程无 `.py` 落盘。
@@ -398,3 +406,147 @@ SSE 事件：
 
 - 本层是「可被发现、可被说服」，不是硬拦：模型若执意手写脚本，仍需 `tools.guard` 兜底（未做，待批）。
 - `~/.dsh/skills/pptx-research-deck` 原样保留，只被本技能第 3 条压住；要收窄它得单独动家目录。
+
+
+## 12. v4 增量：模板分解 → 需求分解 → HTML 模版 → 幻灯片（一致性）
+
+> v1 的模板模式只解析母版/版式，内容仍由模型自由摆放；v2/v3 解决了流程与技能约束。v4 把「用户给的模板」变成可复用的版式 + 文字槽，需求先落到模板页上，HTML 模版与幻灯片从同一份映射生成，导出前校验一致性。
+
+### 12.1 目标
+
+1. **模板可复用，而不是只换母版**：把 `.pptx` 每页拆成「角色 + 干净底图 + 文字槽」，新内容填进槽位，版式/配色/字距沿用模板。
+2. **需求先落到模板页上**：需求分解（outline）每项必须写用哪一页模板、每个字段写什么；放不下就拒收，而不是生成阶段才发现。
+3. **HTML 与幻灯片同源**：同一份 `pages` 映射、同一套模板几何；改文案两边一起变，不存在「HTML 好看、PPTX 跑版」。
+4. **导出前可判定**：模板模式逐页校验底图、字段位置、字号与文字，不一致拒绝导出并指出页号/字段。
+
+### 12.2 功能需求（P0）
+
+1. **⓪ 模板分解（`pptx_studio_template`）**
+   - `pptx_studio_open(template='...')` 进模板模式；未分解时 `plan/slide/add_element/export` 返回 `stage-template`
+     （`force:true` 只用于用户明确要求跳过流程）。
+   - 画布阶段条在原来三步前加一格 `⓪ 模板`：模板未分解时默认停在模板面板（页数/角色/字段/配色/映射），
+     分解完成后才允许进入 ① 调研。
+   - PowerPoint COM 每页渲两遍：原样 `reference`（对照）与隐藏全部文字后的干净底图 `plate`；解析每页角色
+     （`cover/toc/section/content/ending`）、文字字段（`id/sample/box/style`、`fit.maxCjk` 可放字数）、
+     配色/字体、同款底版分组 `families`。
+   - 逐字拆分的单字文本框合并成**一个**字段（`perChar:true`，取各框并集 box，重填按整行居中）；
+     `footer/date/slideNumber` 不作为可填字段。
+   - 产物落 `<deck>/template/{template.json,plates,thumbs,reference}`；`pipeline.template` 记
+     `path/pages/engine/textHidden/design`；`deck.size` 与主题色/字体沿用模板。
+   - `list:true` 只读已分解结果；`render:false` 只解析结构（无底图）；没装 PowerPoint 时先试 Pillow 近似。
+2. **① 需求分解（`pptx_studio_research`）**
+   - 模板模式下 `brief.outline` 每项必须 `{title, templateSlide, fields:{字段id: 文案}}`；无映射返回
+     `template-mapping-required`。
+   - `checkMapping` 校验并拒收：缺 `templateSlide`、页号越界、字段不存在（错误里给出该页可用字段）、
+     字数 > `fit.maxCjk × 1.35`；略超字数、章节页塞超过 3 个字段、连续两页用同一模板页只记 warning。
+   - 拒收码 `template-mapping-invalid`，一次列出全部问题；通过后 `research.outline` 即需求分解结果。
+3. **② HTML 模版（`pptx_studio_preview`）**
+   - 模板模式**不接收手写 HTML**（传了也被忽略）：`pages` 省略时直接用 `research.outline` 的
+     `templateSlide/fields`；宿主用 `renderTemplateHtml` 生成每页 `.slide`（底图 data URL +
+     按模板 box/style 绝对定位的文字）。
+   - `preview.mode='template'` + `preview.pages` 存映射；`preview.html` 落盘，但 `GET /preview`
+     按需重算（映射改了不会看到旧稿）；缺底图返回 `preview-missing-plate`。
+4. **③ 幻灯片（`pptx_studio_plan` / `pptx_studio_slide`）**
+   - `plan` 每页可带 `templateSlide`，模板模式骨架页不发明标题框；`slide` 传 `templateSlide` + `fields`，
+     可加 `extra` 图元。
+   - 位置/字号/颜色来自模板字段，调用方不能自带 `box`；传了 `templateSlide`/`fields` 时手写的
+     `slide.elements` 被忽略（加图元用 `extra`）；不走模板字段、自己写元素的页会被 verify 判为不一致。
+   - `slide.templateSlide` 与 `element.field` 记录来源；底图元素固定 `field='__plate'`。
+5. **④ 校验与导出（`pptx_studio_verify` / `pptx_studio_export`）**
+   - `verify` 逐页检查：是否从模板页建、底图是否同页、字段是否模板所有、字段 box 漂移 > 0.06in、
+     字号差 > 1pt、模板里有内容的字段是否漏填；并逐字比对幻灯片文字与 HTML 映射
+     （`previewConsistency`）。返回 `ok/consistent/issues/warnings`。
+   - `export` 在模板模式先跑 `previewConsistency`：页数、`templateSlide`、字段文字任何一处不一致返回
+     `template-inconsistent` 且不写出文件。
+   - 没装 PowerPoint 且渲染不可用（`render.ok=false`，如 `render:false`）时缺底图是降级而非错误：
+     `verify` 记 warning，导出照常完成；Pillow 近似底图存在但不是原版，属另一种降级（收据提示）。
+
+### 12.3 数据契约增量
+
+`deck.json` 在 v2 模型上增量（`DECK_VERSION` 仍为 2）：
+
+```jsonc
+{
+  "pipeline": {
+    "template": {
+      "path": "templates/brand.pptx", "required": true,
+      "decomposedAt": "2026-11-16T09:00:00.000Z",
+      "pages": 6, "engine": "powerpoint", "textHidden": true,
+      "design": { "palette": ["#0F172A"], "background": "#0F172A", "fonts": { "title": "…", "body": "…" } }
+    },
+    "preview": {
+      "mode": "template",
+      "pages": [{ "templateSlide": 0, "title": "封面", "fields": { "title": "…", "subtitle": "…" } }],
+      "title": "HTML 模版", "width": 1280, "height": 720, "updatedAt": "…"
+    },
+    "stage": "preview"
+  },
+  "slides": [{
+    "id": "s1", "templateSlide": 0,
+    "elements": [
+      { "id": "s1-e1", "type": "image", "box": [0, 0, 13.333, 7.5], "src": "template/plates/s0.jpg", "field": "__plate" },
+      { "id": "s1-e2", "type": "text", "box": [0.9, 4.6, 6.2, 1.1], "text": "2026 年度复盘",
+        "style": { "size": 54, "bold": true, "align": "left" }, "field": "title" }
+    ]
+  }]
+}
+```
+
+`<deck>/template/template.json`（`assets/pptx_template.py` 产出、`lib/template.js` 归一化，`version: 2`）：
+
+```jsonc
+{
+  "version": 2, "path": "templates/brand.pptx",
+  "size": { "w": 13.333, "h": 7.5 }, "engine": "powerpoint",
+  "render": { "ok": true, "engine": "powerpoint", "textHidden": true, "width": 1600, "height": 900 },
+  "design": { "palette": [{ "hex": "#0F172A", "share": 0.42 }], "background": "#0F172A",
+              "fonts": { "title": "…", "body": "…" } },
+  "families": [{ "id": "f1", "role": "content", "slides": [1, 2, 4] }],
+  "slides": [{
+    "index": 0, "role": "cover",
+    "plate": "plates/s0.jpg", "reference": "reference/s0.jpg",
+    "fields": [{
+      "id": "title", "sample": "敦煌夜游", "perChar": true,
+      "box": [0.9, 4.6, 6.2, 1.1],
+      "style": { "size": 54, "bold": true, "align": "ctr", "anchor": "middle", "color": "#F8FAFC", "font": "…" },
+      "fit": { "lines": 1, "cjkPerLine": 6, "maxCjk": 6, "maxLatin": 11 }
+    }],
+    "capacity": { "fields": 2, "maxCjk": 24, "bodyMaxCjk": 18 }
+  }]
+}
+```
+
+字段口径：`slides[].fields[].id` 是**唯一可填的字面**（`title/subtitle/body1…`，按字号从大到小命名）；
+`box` 单位英寸、来自模板；`perChar` 表示由多个单字框合并；`fit.maxCjk` 是该格字数预算
+（`checkMapping` 与 `buildSlideFromTemplate` 都据此判断溢出）。
+
+### 12.4 验收标准
+
+1. 给模板后未调 `pptx_studio_template`：`plan/slide/export` 返回 `stage-template`；分解后 `pipeline.stage`
+   依次为 `research → preview → build`。
+2. `outline` 写漏 `templateSlide`、页号越界、字段名写错或超字数时，`pptx_studio_research` 返回
+   `template-mapping-required` / `template-mapping-invalid`，错误里列出该页可用字段；修正后通过。
+3. 模板模式 `pptx_studio_preview` 不传 HTML 也能生成 HTML 模版：`/preview` 每页 `.slide` 的底图来自对应
+   模板页 `plate`，文字位置与模板 `fields[].box` 同比例（缩放后），`preview.mode='template'` 且
+   `pages` 与 `research.outline` 一致。
+4. **导出后的 `.pptx` 与模板同款底图与字段位置**：回读每页第一层是与 `template/plates/` 同源的整页图片；
+   文字框位置偏差 ≤ 0.06in、字号差 ≤ 1pt、文字内容与 `fields` 一致。
+5. **HTML 与 PPTX 文字必须一致**：只改映射（`research`/`preview`）再重写该页时两边同步变化；若只改单边
+   （例如绕过映射 patch 幻灯片），`pptx_studio_verify` 报不一致，`pptx_studio_export` 返回
+   `template-inconsistent` 且不写出文件。
+6. 没装 PowerPoint 的降级：Pillow 近似（底图存在但非原版，收据提示）或 `render:false` 纯色底
+   （无底图，`verify` 记 warning）时导出仍可完成。
+7. `npm test` 全绿（model / store / python / skills / template / e2e / client）。
+
+### 12.5 非目标与已知边界
+
+- 不重排模板版式：只填文字槽 + `extra` 图元；页内装饰不提供单独编辑，要改装饰回 PowerPoint 改模板再分解。
+- 不做 OOXML 占位符自动映射（`{{title}}` 自动填）：仍由模型显式给 `fields`。
+- 不继承模板的转场/动画：导出特效按 deck 模型字段，模板只提供版式、底图、配色与字体。
+- 底图是整页图片：动态图表/表格等要原生可编辑的内容放 `extra`，不要指望从底图里抠出来。
+
+
+- 继承色文字按底图取色：无显式颜色的字段按字段框内的底图亮度在深/浅墨色间选择（`apply_contrast_colors`），
+  显式 `style.color` 永远优先。
+- 模板可在工作区外：`pptx_studio_open(template=绝对路径)` 会按内容哈希复制到 `.pptx-studio/_templates/`，
+  后续步骤只读工作区内副本；`ensureInside` 同时修正了「跨盘符路径被当成工作区内」的旧漏洞。

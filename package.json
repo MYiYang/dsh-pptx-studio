@@ -1,7 +1,7 @@
 {
   "name": "dsh-pptx-studio",
-  "version": "0.2.0",
-  "description": "PPTX Studio for DeepSeek Harness: research → HTML mockup → editable PPTX, with a live canvas that edits slide transitions, animations, notes, themes and native charts.",
+  "version": "0.3.0",
+  "description": "PPTX Studio for DeepSeek Harness: template decomposition → requirement mapping → HTML mockup → editable PPTX, with a live canvas and consistency verification.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -18,7 +18,8 @@
     "cordis.patch.yml",
     "REQUIREMENTS.md",
     "README.md",
-    "test/"
+    "LICENSE",
+    "!assets/__pycache__"
   ],
   "license": "MIT",
   "keywords": [
@@ -34,7 +35,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node test/model.test.js && node test/store.test.js && node test/python.test.js && node test/skills.test.js && node test/e2e.test.js && node test/client.test.js"
+    "test": "node test/model.test.js && node test/template.test.js && node test/store.test.js && node test/python.test.js && node test/skills.test.js && node test/e2e.test.js && node test/client.test.js"
   },
   "dsh": {
     "bundle": {

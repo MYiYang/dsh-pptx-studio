@@ -3,9 +3,12 @@
 在 DSH 右侧开一块 **PPTX 实时画布**。它不是「一句话直接吐一个 .pptx」：默认走
 **调研分析 → HTML 效果预览 → 可编辑 PPTX** 三步，让用户在花时间生成幻灯片之前，先看见
 分析结论和视觉方向；确认后再逐页画出带转场、入场动画、备注、主题和图表原生可编辑的 `.pptx`。
+用户给一份 `.pptx` 模板时改走**模板优先**流程：先分解模板，再把需求逐页映射到模板字段，
+HTML 与幻灯片从同一份映射生成（见下文「模板优先」一节）。
 
 ```
-Agent：pptx_studio_research ──► 画布「① 调研」面板（受众/目标/大纲/来源/配色）
+Agent：pptx_studio_template ─► 画布「⓪ 模板」面板（每页角色/可填字段/配色；仅模板模式）
+       pptx_studio_research ──► 画布「① 调研」面板（受众/目标/大纲/来源/配色）
        pptx_studio_preview  ──► 画布「② HTML 效果」沙箱 iframe（先确认视觉方向）
        pptx_studio_plan/slide ─► 画布「③ 幻灯片」逐页/逐元素绘制
        pptx_studio_export   ──► 带转场/动画/备注/图表的真实 .pptx
@@ -17,15 +20,18 @@ Agent：pptx_studio_research ──► 画布「① 调研」面板（受众/目
 
 | 文件 | 作用 |
 |---|---|
-| `index.js` | Host 半侧：10 个模型工具 + SSE + 调研/HTML 预览/反馈/导出/资源路由 + 消息注入 |
-| `client.js` | 客户端半侧：右侧栏画布（阶段条 / 调研面板 / HTML 预览 / 缩略图 / 画布 / 属性 / 动效 / 主题 / 意见）+ 工具卡片 |
+| `index.js` | Host 半侧：12 个模型工具 + SSE + 调研/HTML 预览/模板分解/反馈/导出/资源路由 + 消息注入 |
+| `client.js` | 客户端半侧：右侧栏画布（阶段条 / 模板面板 / 调研面板 / HTML 预览 / 缩略图 / 画布 / 属性 / 动效 / 主题 / 意见）+ 工具卡片 |
 | `lib/model.js` | deck 模型 v2：调研/预览流水线、转场、入场动画、备注、背景、阴影、主题、原生图表 |
 | `lib/store.js` | deck 存储：内存 + 400ms 防抖落盘 + 事件广播 |
 | `lib/python.js` | python-pptx 桥：解释器探测 + 子进程 + JSON 解析 |
+| `lib/template.js` | 模板优先核心：spec 归一化、需求映射校验（`checkMapping`）、HTML 模版渲染、按模板字段建页、一致性比对 |
 | `lib/skills.js` | 把包内 `skills/` 注册进宿主技能表（`ctx.inject(['skills'])`，随插件卸载自动撤回） |
-| `skills/pptx-studio/SKILL.md` | **插件自带的技能**：写 pptx 走插件的规则 + 七步工具链 + 坑位清单 |
+| `skills/pptx-studio/SKILL.md` | **插件自带的技能**：写 pptx 走插件的规则 + 七步工具链（含模板模式分支）+ 坑位清单 |
 | `assets/pptx_build.py` | `deck.json → 原生可编辑 .pptx`（含 OOXML 转场/动画/备注/背景/隐藏页/阴影/图表） |
 | `assets/pptx_inspect.py` | 解析模板：尺寸、版式、占位符、主题色与字体 |
+| `assets/pptx_template.py` | ⓪ 拆模板：逐页解析角色/文字槽/配色，渲「原样 + 去字」两套底图（无 PowerPoint 时 Pillow 近似） |
+| `assets/pptx_render.ps1` | PowerPoint COM 渲图脚本：每页渲两遍（原样 `reference` + 隐藏全部文字后的 `plate`） |
 | `REQUIREMENTS.md` | 需求分析（场景、分级、技术取舍、验收标准、风险 + v2 增量） |
 
 ## 为什么写 pptx 必须走插件（自带的技能就是约束）
@@ -62,13 +68,80 @@ Agent：pptx_studio_research ──► 画布「① 调研」面板（受众/目
 - 已经有页面的旧 deck（或用户在画布上手工加过页）视为已完成流程，不会被卡住。
 - 每个阶段都有意见输入框：调研阶段发给 `pptx_studio_research`，HTML 阶段先改
   `pptx_studio_preview` 再同步到幻灯片，幻灯片阶段仍走元素/区域定位反馈。
+- 带 `.pptx` 模板时，这三步之前还有「⓪ 模板分解」（阶段闸门返回 `stage-template`），见下一节。
+
+## 模板优先：PPTX 模版 → 需求分解 → HTML 模版 → 幻灯片
+
+用户给一份 `.pptx` 模板时，流程多出前置的「⓪ 模板分解」，之后每一步都从模板派生：
+
+```
+       给了 .pptx 模板（pptx_studio_open 传 template）
+                    │
+                    ▼
+⓪ pptx_studio_template ──► <deck>/template/{template.json,plates,thumbs,reference}
+   每页渲两遍：原样 reference + 隐藏全部文字后的干净底图 plate
+   解析每页角色（封面/目录/章节/内容/结尾）与文字字段（id/box/style/可放字数）
+                    │
+                    ▼
+① pptx_studio_research ──► brief.outline 每项 {title, templateSlide, fields}
+   需求直接落到模板页上；checkMapping 校验页号/字段名/字数，不合格拒收并列出可用字段
+                    │
+                    ▼
+② pptx_studio_preview ──► preview.mode='template' + pages（同一份映射）
+   不手写 HTML：宿主用 renderTemplateHtml 把映射 + 模板底图/字段位置渲成 HTML 模版
+                    │
+                    ▼
+③ pptx_studio_slide ───► 每页 templateSlide + fields → 底图 + 模板 box/style 的文字
+   pptx_studio_plan 用同一顺序列页（每页可带 templateSlide）；位置不由调用方给，不会跑版
+                    │
+                    ▼
+④ pptx_studio_verify ──► pptx_studio_export
+   逐页比对底图/字段位置/字号/文字；不一致时 export 返回 template-inconsistent，拒绝导出
+```
+
+| 阶段 | 工具 | 输入 | 输出 |
+|---|---|---|---|
+| ⓪ 模板分解 | `pptx_studio_template` | deck（`open` 时传了 `template`）；可选 `pages`（只分解前 N 页）、`render:false`（只解析结构）、`list:true`（只读上次结果） | 每页角色、干净底图、文字字段（收据里是 `id=示例（≤N字）`）；`pipeline.template` 记 path/pages/engine/textHidden；spec 落 `template/template.json` |
+| ① 需求分解 | `pptx_studio_research` | `brief`：`summary/audience/goal/tone/constraints` + `outline:[{title,intent,source,templateSlide,fields}]` | 写 `pipeline.research.outline`；缺映射返回 `template-mapping-required`，页号越界/字段不存在/超字数返回 `template-mapping-invalid` 并列出该页可用字段 |
+| ② HTML 模版 | `pptx_studio_preview` | `pages`（可省略，默认取 `research.outline` 的 `templateSlide/fields`） | `preview.mode='template'` + `preview.pages`；HTML 由 `/preview` 路由按需生成 |
+| ③ 幻灯片 | `pptx_studio_plan` → `pptx_studio_slide` | `plan`：按同一顺序列页（每页可带 `templateSlide`）；`slide`：`templateSlide` + `fields`（可加 `extra` 图元） | 每页 = 模板底图 + 按模板 `box/style` 生成的文字；`slide.templateSlide` / `element.field` 记录来源 |
+| ④ 校验/导出 | `pptx_studio_verify` → `pptx_studio_export` | deck | `verify` 返回 `consistent/issues/warnings`；模板模式不一致时 `export` 返回 `template-inconsistent`，文件不写出 |
+
+**为什么不会跑版、不会漂移**：模板模式只维护一份数据——`preview.pages` 那一份逐页映射
+（第 N 页用模板第几页、每个字段写什么）。HTML 模版由 `renderTemplateHtml(spec, pages)` 生成，
+幻灯片由 `buildSlideFromTemplate(spec, page, fields)` 生成：几何都来自模板字段的 `box/style`
+（`template.json` 的 `slides[].fields[]`），调用方没有机会自带坐标，所以「手滑写错位置」跑不了版；
+文字都来自同一份 `fields`，所以改一句文案不会出现「HTML 改了、PPTX 没改」的漂移。
+导出前再对一遍：页数、`templateSlide`、每个字段的文字必须逐字一致，否则 `pptx_studio_export`
+直接返回 `template-inconsistent`，不写出文件。
+
+模板模式的最小调用序列：
+
+```
+pptx_studio_open(template: 'templates/brand.pptx')
+pptx_studio_template
+pptx_studio_research(brief: { summary: '…', outline: [
+  { title: '封面', templateSlide: 0, fields: { title: '2026 年度复盘', subtitle: '管理层评审' } },
+  { title: '结论', templateSlide: 3, fields: { title: '三件事', body1: '……' } },
+] })
+pptx_studio_preview            # 不传 html/pages，宿主按 outline 生成 HTML 模版
+pptx_studio_plan(slides: [{ title: '封面', templateSlide: 0 }, …])
+pptx_studio_slide(index: 1, templateSlide: 0, fields: { title: '2026 年度复盘' })
+pptx_studio_verify → pptx_studio_export
+```
+
+产物落在 `<deck>/template/`：`template.json`（页/角色/字段/配色）、`plates/`（去字干净底图，
+导出时铺满整页）、`thumbs/`（HTML 模版内联用的小图，避免预览文件几十 MB）、
+`reference/`（原样整页渲染，对照用）。
 
 ## 怎么用（对话里）
 
 ```
 用 pptx_studio_open 打开画布，标题「2026 年度复盘」，模板用 templates/brand.pptx
+pptx_studio_template：先把模板拆成每页版式与可填字段（模板模式下这一步必须先做）
 先用 pptx_studio_research：受众是管理层，目标是批准预算，先调研行业数据并给 8 页大纲
-pptx_studio_preview：按上面的调研出一份深色底的 HTML 视觉稿（每页一个 .slide）
+  —— 模板模式：outline 每项写 templateSlide 与 fields，把每页落到模板页上
+pptx_studio_preview：模板模式不用给 HTML，宿主按同一份映射生成 HTML 模版
 pptx_studio_plan：8 页，封面/背景/数据/结论/建议/…
 pptx_studio_slide 第 1 页：……（带 transition、notes、元素的 anim）
 pptx_studio_deck：主题 accent 改成 #22D3EE，画布改成 16:9
@@ -84,12 +157,23 @@ pptx_studio_export：导出到 reports/2026-review.pptx
 
 | 阶段 | 画布上发生什么 | 依据 |
 |---|---|---|
-| 工具调用开始 | 右侧画布立刻被打开/切到前台（不等工具返回）；还没有 deck 时显示纸面骨架 + 灰色缩略图，编辑区与功能区的卡片已经在屏幕上 | 工具卡片在 `preparing`/`start` 阶段就 `openTab`；空状态渲染的是完整 shell 而不是一句提示 |
+| 工具调用开始 | **任何** `pptx_studio_*` 调用一开始就把右侧画布打开并切到前台（不等工具返回）；新画布还没有 deck 时显示「正在准备新的画布…」的进度骨架，**不会**退回上一份 deck | 12 个工具各有一张 `tool.call.toolview` 卡片，在 `preparing`/`start` 阶段就 `openTab`；`pptx_studio_open` 带 `pending` 参数，画布据此渲染等待态而不是就近加载旧 deck |
+| 调用进行中 | 画布顶部有一条进度条：`正在〈绘制幻灯片〉… deck: xxx 12s`；页签标题出现一个呼吸圆点。会话里对应步骤的卡片也写明「画布已切到这一步」 | 宿主把每次调用的 `{tool, deckId, state, startedAt}` 发布到 `GET …/session/events?sessionId=`（SSE）与会话快照 `GET …/session?sessionId=` |
+| deck 一落地 | 画布立刻切到这份 deck（工具返回前就切；工具卡片已经不在了也一样） | 客户端订阅会话进度流：`deckId` 变化 → 切 deck；`open` 的 `running` 阶段没有 deck 时先把旧 deck 移出屏幕 |
 | 大纲 | 状态条先报「正在摆放 N 页骨架」，随后逐页（每页 160ms）落到缩略图栏 | `pptx_studio_plan` 的 `planning` + `slide(skeleton)` 事件 |
 | 写一页 | 先报「正在准备第 N 页」，220ms 后整页内容才写入；画布上这页先以铅笔幽灵（虚线 + 低透明度 + 扫光）出现，再逐个元素落定（42–75ms/个）；幻灯片下方有 ✎ 绘制 HUD 与元素进度条，编辑区标题同时显示「逐页绘制中」徽标 | `slide(begin)` → `slide(content)`；客户端的逐元素 reveal 队列 |
 | 加一个元素 | 同样先报「正在往第 N 页加元素」，元素再以幽灵→闪一下的方式出现 | `add_element` 的 `drawing(begin)` + `element` 事件 |
 | 画完 | HUD 自动收起；期间编辑区、缩略图栏、功能区的位置和高度不跳 | 缩略图栏常驻（无页时放 3 个骨架格），编辑区卡片 `min-height` 兜底 |
 
+- **「切到画布」的范围**：不只是 `pptx_studio_open`。模板分解、调研、HTML 效果稿、大纲、写页、改元素、
+  校验、导出——每一步都有自己的卡片，都会把画布拉到前台并指向该步写的 deck；用户在聊天里翻旧消息时
+  卡片不会反向抢焦点（只有正在跑的那次调用会切）。
+- **不会显示上一份 pptx**：新一次 `pptx_studio_open` 在 preparing 阶段就用 `pending` 打开画布，
+  画布显示该次调用的等待骨架（带工具名/耗时）而不是最近一次落盘的 deck；旧 deck 的 `/state` 响应若在
+  切换后才回来会被丢掉（`deckIdRef` 比对），不会把旧画布盖回来。`pending` 参数带时间戳，页面刷新后
+  过期的 pending 会自动失效、退回正常选 deck，不会把画布卡死在空态。
+- `GET …/session` 与 `…/session/events` 不可达时（老宿主/老客户端）一切照旧：卡片走 `openTab` 的
+  navigation params 切换 deck，只是少了顶部那条进度条。
 - 每个元素落定时都有入场动画：文本是自左向右「写出来」（clip reveal），图形/图片/表格是淡入 + 轻微缩放。
 - 偏好减少动效（`prefers-reduced-motion`）时动画关闭，但幽灵→落定的节奏与进度提示仍在。
 - 缩略图不是另一套简化渲染：它和画布用同一份元素模型、页面自己的底色与页尺寸（16:9 / 4:3 / 16:10 / A4），
@@ -115,8 +199,8 @@ pptx_studio_export：导出到 reports/2026-review.pptx
 
 | 快捷键 | 动作 | 说明 |
 |---|---|---|
-| `Ctrl+S` | 保存 / 导出 PPTX | 走 `/export`，按钮也改为「保存 PPTX」 |
-| `Ctrl+Shift+S` | 另存 / 下载 | 导出后打开 `/download` |
+| `Ctrl+S` | 保存 | 写进 `.pptx-studio/<deckId>/deck.pptx`（按钮「保存」），面板回报文件名与体积 |
+| `Ctrl+Shift+S` | 下载 / 另存 | 弹宿主目录框选位置，导出到该目录（同名自动改名，绝不覆盖） |
 | `Ctrl+Z` / `Ctrl+Shift+Z` / `Ctrl+Y` | 撤销 / 重做 | 与工具栏 ↶ ↷ 同源 |
 | `Ctrl+X` / `Ctrl+C` / `Ctrl+V` | 剪切 / 复制 / 粘贴元素 | 支持多选；内部剪贴板 + 系统剪贴板 JSON 双通道 |
 | `Ctrl+A` | 选中本页全部元素 | 多选后显示虚线框和批量剪切/删除面板 |
@@ -128,9 +212,13 @@ pptx_studio_export：导出到 reports/2026-review.pptx
 | `Esc` | 取消选择 / 关闭浮层 | |
 | `?` | 打开/关闭快捷键帮助 | 功能区右上角也有「快捷键」按钮 |
 
-### 阶段条与两个前置面板
+### 阶段条与三个前置面板
 
-- 顶栏下方三步条 `① 调研 / ② HTML / ③ 幻灯片`：已完成打勾，点击随时切换查看；默认跟随当前阶段。
+- 顶栏下方阶段条 `⓪ 模板 / ① 调研 / ② HTML / ③ 幻灯片`：已完成打勾，点击随时切换查看；默认跟随当前阶段。
+  模板模式下 `⓪` 未完成时阶段闸门停在 `stage-template`，画布默认停在模板面板；空白 deck 的模板面板显示「没有使用模板」。
+- **模板面板**：模板页数、渲染引擎、文字是否已隐去，配色/字体/文字颜色；每页角色（封面/目录/章节/内容/结尾）、
+  可填字段（含 `≤N 字` 字数预算）与配色；以及本 deck 的页映射（第 N 页来自模板第几页、已填哪些字段）。
+  模板还没分解时显示「正在分解模板…」，分解失败可点「刷新模板」重新拉取。
 - **调研面板**：分析摘要、受众/目标/语气/约束、编号大纲、关键结论、可点击来源、配色色板与字体方向。
 - **HTML 预览面板**：服务端 CSP `sandbox` + iframe `sandbox=""` 双保险，脚本和外链样式不执行；
   提供刷新、新窗口打开、下载 `preview.html`。预览是静态视觉稿，图片用内联 data URL 最稳。
@@ -200,6 +288,7 @@ pptx_studio_export：导出到 reports/2026-review.pptx
 | 工具 | 说明 |
 |---|---|
 | `pptx_studio_open` | 建/续画布；`template` 进模板模式（沿用母版与版式） |
+| `pptx_studio_template` | 模板模式第 0 步：分解模板（每页角色、去字干净底图、可填文字字段）；`list:true` 只读、`render:false` 只解析结构 |
 | `pptx_studio_research` | 第一步：交需求分析/调研 brief（摘要、受众、目标、大纲、结论、来源、配色/字体） |
 | `pptx_studio_preview` | 第二步：交自包含 HTML 视觉稿（可选 `width/height` 设计画布尺寸），写入 `preview.html`，画布用沙箱 iframe 等比缩放展示 |
 | `pptx_studio_deck` | 整份 deck 的标题、画布尺寸、主题色/字体 |
@@ -208,6 +297,7 @@ pptx_studio_export：导出到 reports/2026-review.pptx
 | `pptx_studio_add_element` | 追加单个元素（可带 chart/anim/shadow） |
 | `pptx_studio_patch` | 改/删一个元素（修正闭环的主力） |
 | `pptx_studio_inspect` | 读回模型（页 id、元素 id/box/文本、阶段、转场/备注） |
+| `pptx_studio_verify` | 一致性校验：模板底图/字段位置/字号 + 幻灯片文字 vs HTML 模版；不一致时 export 拒绝导出 |
 | `pptx_studio_export` | 导出真实 `.pptx`，返回路径/页数/字节/特效统计 |
 
 模型可见的收据都很短（`deck=…；阶段=…；3 页；…`），deck 本体走画布与 SSE，不烧 token。
@@ -217,11 +307,15 @@ pptx_studio_export：导出到 reports/2026-review.pptx
 ## 数据与落盘
 
 ```
-<cwd>/.pptx-studio/<deckId>/deck.json      # 模型（唯一真相，含 pipeline/theme/特效）
-<cwd>/.pptx-studio/<deckId>/deck.pptx      # 最近一次导出
-<cwd>/.pptx-studio/<deckId>/preview.html   # 第二步的 HTML 视觉稿
-<cwd>/.pptx-studio/<deckId>/assets/        # 元素引用的图片
-<cwd>/.pptx-studio/<deckId>/template.json  # 模板解析结果
+<cwd>/.pptx-studio/<deckId>/deck.json               # 模型（唯一真相，含 pipeline/theme/特效）
+<cwd>/.pptx-studio/<deckId>/deck.pptx               # 最近一次导出
+<cwd>/.pptx-studio/<deckId>/preview.html            # 第二步的 HTML 视觉稿（模板模式是生成结果的副本）
+<cwd>/.pptx-studio/<deckId>/assets/                 # 元素引用的图片
+<cwd>/.pptx-studio/<deckId>/template.json           # 打开时 pptx_inspect 的版式摘要（母版/占位符）
+<cwd>/.pptx-studio/<deckId>/template/template.json  # ⓪ 分解出的模板 spec（页/角色/字段/配色，v2）
+<cwd>/.pptx-studio/<deckId>/template/plates/        # 去字干净底图（导出时铺满整页）
+<cwd>/.pptx-studio/<deckId>/template/thumbs/        # HTML 模版内联用的缩略底图
+<cwd>/.pptx-studio/<deckId>/template/reference/     # 原样整页渲染（对照用）
 ```
 
 SSE 事件：`deck`（全量）`pipeline`（阶段变化）`slide`（新增/替换）`element`（新增/替换/删除）
@@ -235,13 +329,16 @@ SSE 事件：`deck`（全量）`pipeline`（阶段变化）`slide`（新增/替�
 | `GET /dsh-pptx-studio/api/decks?sessionId=` | 画布列表：内存里的 + **磁盘上有 `deck.json` 但本进程还没加载的**（重启/重载后仍能找回，`fromDisk:true`） |
 | `GET …/state?deck=&sessionId=` | 全量模型（含 pipeline/theme）+ 模板摘要 + `preview` 路径 + 工作区 `cwd` |
 | `GET …/events?deck=` | SSE 增量流 |
+| `GET …/session?sessionId=` | 会话当前/最近一次 pptx 调用的进度快照：`{task: {tool,label,deckId,state,message,startedAt,seq}}`；从未调用过为 `null` |
+| `GET …/session/events?sessionId=` | 会话级 SSE：先推一份快照，之后每次调用开始/结束推一条 `{type:'task', task}`。画布据此把「显示上一份 deck 的 tab」切到正在写的 deck，并在顶部显示「正在〈某步〉」进度条 |
 | `GET …/preview?deck=` | 第二步 HTML 视觉稿；`?download=1` 下载；响应带 CSP `sandbox`（无脚本/无外链样式） |
 | `POST …/edit` | 画布编辑 `{deckId, ops:[…]}`：`element.patch/replace/add/duplicate/reorder`、`slide.add/remove/move`、`slide.patch`、`deck.title/theme/size` |
 | `POST …/upload` | 图片：`{deckId, slideId, dataUrl, box}` → 内容哈希去重后写入 `assets/` |
 | `GET …/asset?deck=&path=` | 元素图片（`assets/xxx.png` 按 deck 目录解析；越界 403） |
 | `POST …/feedback` | 「阶段 + 页 + 元素 + bbox + 意见」→ 会话用户消息 |
 | `POST …/deck/delete` | 删画布：先清内存副本与防抖写入，再删目录；id 必须是 `deck_<日期>_<hash>` |
-| `POST …/export` · `GET …/download?deck=` | 导出；下载（未导出时按需先导出） |
+| `POST …/export` | 导出：`{deckId, path?}` 写进 deck 目录或工作区内路径；`{deckId, dir}` 写进用户用宿主目录框选中的**任意绝对目录**（不合规 400 `bad-directory`，同名自动 `名称 (1).pptx`） |
+| `GET …/download?deck=` | 附件形式的 `.pptx`（未导出时按需先导出）；现在是画布「下载」在**没有**目录选择器时的兜底通道（页面 fetch 成 blob 再交给浏览器，不再用 `window.open`） |
 
 ## 依赖与配置
 
@@ -276,20 +373,28 @@ dsh plugin --profile <p> add link:<本仓库绝对路径>
 ## 测试
 
 ```bash
-npm test     # model / store / python / e2e / client 五组
+npm test     # model / template / store / python / skills / e2e / client 七组
 ```
 
-- `test/model.test.js`：模型 v2 的主题/转场/动画/阴影/图表/流水线归一化与阶段推导（23 项）。
-- `test/python.test.js`：真跑 python-pptx；回读 zip 校验 OOXML 子元素顺序、`p:transition`、
+- `test/model.test.js`（26 项）：模型 v2 的主题/转场/动画/阴影/图表/流水线归一化与阶段推导。
+- `test/template.test.js`（27 项）：模板 spec 归一化、`checkMapping` 需求映射校验、`renderTemplateHtml`、
+  `buildSlideFromTemplate`、`previewConsistency`；不依赖 Python / PowerPoint。
+- `test/store.test.js`（7 项）：deck 目录存取、防抖落盘、路径越界。
+- `test/python.test.js`（7 项）：真跑 python-pptx；回读 zip 校验 OOXML 子元素顺序、`p:transition`、
   `p:timing`、`a:outerShdw`、notes、隐藏页、chart 部件；`--no-effects` 回退。
-- `test/e2e.test.js`（20 项）：假 `ctx` 真跑 `apply()` → 10 个工具 + 全部 HTTP 路由；重点覆盖
+- `test/skills.test.js`（14 项）：frontmatter 解析、`readSkill` / `loadBundledSkills`、
+  `skillRegistration`（含必填 `source`）与 `registerBundledSkills` 注入/撤回。
+- `test/e2e.test.js`（31 项）：假 `ctx` 真跑 `apply()` → 12 个工具 + 全部 HTTP 路由；重点覆盖
   「未调研/未预览被拦住 → research → preview → plan/slide → export features」、画布编辑、
-  `slide.patch`/`deck.theme`/`deck.size`、预览 CSP、上传去重、资产越界、导出字节；另有
-  「每页写入前先发 begin 状态、planning 先于骨架页、写页真的停顿 ≥180ms」的可见性回归。
-- `test/client.test.js`（25 项）：按 Web 载体的方式加载 `client.js`，渲染画布，验证编辑区/功能区
-  分界、阶段条与调研/HTML 面板、iframe 沙箱与等比缩放、转场设置与预览、主题/尺寸、图表插入、
+  `slide.patch`/`deck.theme`/`deck.size`、预览 CSP、上传去重、资产越界、导出字节、
+  「导出到用户选的绝对目录且同名不覆盖 / 非法目录 400」；模板模式覆盖
+  「未分解被拦 → 分解 → 需求映射拒收/通过 → 同一映射生成 HTML → 按模板建页 → verify/export 拒绝漂移」；
+  另有「每页写入前先发 begin 状态、planning 先于骨架页、写页真的停顿 ≥180ms」的可见性回归。
+- `test/client.test.js`（41 项）：按 Web 载体的方式加载 `client.js`，渲染画布，验证编辑区/功能区
+  分界、阶段条与模板/调研/HTML 面板、iframe 沙箱与等比缩放、转场设置与预览、主题/尺寸、图表插入、
   元素动画/阴影、保存/剪贴/撤销/新增页/多选快捷键、输入框原生按键、主题令牌与 1in=96px；
-  以及「无 deck 时编辑区已在」「SSE 新页先是幽灵再逐个落定 + HUD」「工具卡片 start 阶段就开画布」
+  以及「下载按钮常显、点它走宿主目录框带 `dir` 导出、取消不导出、无目录服务时退化到 blob 下载」、
+  「无 deck 时编辑区已在」「SSE 新页先是幽灵再逐个落定 + HUD」「工具卡片 start 阶段就开画布」
   「tab 参数换 deck」「等待时轮询 deck」；缩略图按页尺寸/底色出图、整页缩放而不是 1.6px 小字硬画。
 - 真 DOM 冒烟（真 React 18 + jsdom，65 项）：点选、拖动提交 box、拖角缩放、双击改字、缩略图切页、
   方向键微调、框选、插图上传、反馈 sendDraft+submit、导出/下载/关闭；外加无 deck 骨架 shell、
@@ -312,3 +417,15 @@ npm test     # model / store / python / e2e / client 五组
 - 编辑以「本地先改、随发随存」为准：宿主不可达时改动留在画布上并提示，不会静默丢失。
 - 只在当前页编辑；跨页批量改（如「全部页标题字号统一」）仍走对话让模型用工具改。
 - 反馈默认走原生输入框管线（`setDraft` + `submit`，等同用户按 Enter）；没有 composer 时才回落到 Host 注入。
+- **模板底图是整页图片**：⓪ 之后每页的装饰/背景都以 `template/plates/*.jpg` 整页图参与导出，
+  页内装饰**不能单独选中改**；要改装饰回 PowerPoint 改模板，再重新跑 `pptx_studio_template`。
+  能改的是字段文字和 `extra` 图元。
+- **没装 PowerPoint 时的降级**：分解先试 PowerPoint COM；失败回退 Pillow 近似（只拼图片与纯色形状，
+  渐变/文字不参与，不是原版渲染；收据会提示底图非 PowerPoint 渲染，成品需人工核对），或传
+  `render:false` 只解析结构（没有底图，导出是纯色底；此时 `verify` 把缺底图记为 warning 而不是 issue）。
+- **逐字拆分的标题会合并成一个字段**：模板把标题拆成单字文本框（方便字距）时，字段表只暴露一个
+  `perChar` 字段，重填按整行居中，不会散成单字、也不会沿用原来的单字间距。
+- **继承色的文字按底图取色**：模板里没写显式颜色的文字，会按底图在字段框内的亮度自动选深/浅色
+  （`apply_contrast_colors`），避免「深色字压在深色牌匾上」看不见；想要别的颜色就显式传 `style.color`。
+- **模板可以在工作区外**：`pptx_studio_open(template=...)` 接受绝对路径（如 `~/Downloads/xxx.pptx`），
+  宿主会按内容哈希把它复制到 `.pptx-studio/_templates/` 再使用，后续步骤不会再去读工作区外的文件。

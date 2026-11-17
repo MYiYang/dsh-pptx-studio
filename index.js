@@ -13,7 +13,7 @@
  * @module dsh-pptx-studio
  */
 import { createHash } from 'node:crypto'
-import { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, extname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -23,9 +23,13 @@ import {
   MAX_PREVIEW_HTML,
   MAX_SLIDES,
   applyElementPatch,
+  auditDeck,
   auditElement,
   auditSlide,
   clampText,
+  collectElementIssues,
+  collectSlideIssues,
+  mergeElement,
   normalizeBox,
   normalizeElement,
   normalizePipeline,
@@ -40,6 +44,18 @@ import {
 } from './lib/model.js'
 import { PythonRunner } from './lib/python.js'
 import { registerBundledSkills } from './lib/skills.js'
+import {
+  buildSlideFromTemplate,
+  checkMapping,
+  normalizeFill,
+  normalizeTemplateSpec,
+  pagesFromDeck,
+  previewConsistency,
+  renderTemplateHtml,
+  templateCatalogue,
+  templatePage,
+  templateSummary,
+} from './lib/template.js'
 
 export const inject = ['tools', 'webServer', 'connection']
 
@@ -70,6 +86,12 @@ const ASSET_TYPES = {
 const PPTX_MIME = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
 /** File name of the HTML design preview inside the deck directory. */
 const PREVIEW_FILE = 'preview.html'
+
+/** Decomposed-template spec, relative to a deck directory. */
+const TEMPLATE_SPEC_FILE = 'template/template.json'
+
+/** Where the decomposer writes plates / thumbnails, relative to a deck directory. */
+const TEMPLATE_DIR = 'template'
 /** Accepted `<img>` upload data URLs. */
 const IMAGE_DATA_URL = /^data:image\/(png|jpe?g|gif|webp|svg\+xml);base64,([A-Za-z0-9+/=\s]+)$/
 /** Every op kind `POST /edit` accepts. */
@@ -329,13 +351,41 @@ function contentTypeOf(file) {
  * @returns {{ascii: string, encoded: string}} plain and RFC 5987 file names.
  */
 function downloadFilename(title, extension = 'pptx') {
-  const raw = clampText(String(title ?? ''), 200)
+  const raw = deckFileStem(title)
+  const ascii = raw.replace(/[^\x20-\x7e]/g, '_') || 'deck'
+  return { ascii: `${ascii}.${extension}`, encoded: encodeURIComponent(`${raw}.${extension}`) }
+}
+
+/**
+ * Turn a deck title into a file name stem that every common filesystem accepts:
+ * no separators, no reserved characters, no trailing dots or spaces.
+ * @param {unknown} title - deck title.
+ * @returns {string} file name without extension.
+ */
+function deckFileStem(title) {
+  return clampText(String(title ?? ''), 200)
     .replace(/[\\/:*?"<>|\u0000-\u001f]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
+    .replace(/[. ]+$/, '')
     .slice(0, 80) || 'deck'
-  const ascii = raw.replace(/[^\x20-\x7e]/g, '_') || 'deck'
-  return { ascii: `${ascii}.${extension}`, encoded: encodeURIComponent(`${raw}.${extension}`) }
+}
+
+/**
+ * Resolve one user-picked folder into the `.pptx` path it should receive.
+ * A save must never eat a file the user already has, so the name steps aside
+ * (`deck (1).pptx`) instead of overwriting.
+ * @param {string} dir - absolute directory the user picked.
+ * @param {unknown} title - deck title.
+ * @returns {string} absolute output path that does not exist yet.
+ */
+function uniquePptxTarget(dir, title) {
+  const stem = deckFileStem(title)
+  for (let index = 0; index < 1000; index += 1) {
+    const candidate = join(dir, index === 0 ? `${stem}.pptx` : `${stem} (${index}).pptx`)
+    if (!existsSync(candidate)) return candidate
+  }
+  return join(dir, `${stem}-${Date.now()}.pptx`)
 }
 
 /**
@@ -632,7 +682,16 @@ const STAGE_LABELS = { research: '① 调研分析', preview: '② HTML 效果',
  */
 function renderReceipt(_args, value) {
   if (!value || value.ok === false) {
-    return [{ type: 'text', text: `pptx-studio 未完成：${value?.code ?? 'error'}${value?.hint ? ` — ${value.hint}` : ''}` }]
+    const lines = [`pptx-studio 未完成：${value?.code ?? 'error'}${value?.hint ? ` — ${value.hint}` : ''}`]
+    // A refusal is only actionable if it names what is wrong; the list used to
+    // live in the JSON payload the model never sees.
+    if (Array.isArray(value?.issues) && value.issues.length > 0) {
+      lines.push(`问题 ${value.issues.length} 处：${value.issues.slice(0, 8).join('；')}`)
+    }
+    if (Array.isArray(value?.warnings) && value.warnings.length > 0) {
+      lines.push(`提醒 ${value.warnings.length} 条：${value.warnings.slice(0, 5).join('；')}`)
+    }
+    return [{ type: 'text', text: lines.join('\n') }]
   }
   const parts = []
   // `inspect` answers with the deck model itself; summarise it for the model
@@ -751,6 +810,12 @@ export async function apply(ctx, config = {}) {
   })
   /** Template summaries are small; keeping them in memory is enough. */
   const templateInfo = new Map()
+  /** Decomposed template specs, keyed by deck id (disk copy is the truth). */
+  const templateSpecs = new Map()
+  /** Plate file -> data URL, so the HTML sheet does not re-encode on every open. */
+  const plateCache = new Map()
+  /** deck id -> latest generated HTML sheet (keyed by the mapping it came from). */
+  const templateSheetCache = new Map()
 
   // ── helpers ────────────────────────────────────────────────────────────────
 
@@ -866,6 +931,47 @@ export async function apply(ctx, config = {}) {
   }
 
   /**
+   * Resolve the template path a caller passed.
+   *
+   * Workspace paths are used as-is. A path outside the workspace (the common
+   * case: the user points at `~/Downloads/xxx.pptx`) is copied into the plugin
+   * store first, so every later step — decomposition, rendering, export — reads
+   * a file that lives inside the workspace and the sandbox boundary stays
+   * intact. The copy is content-addressed, so re-opening the same template does
+   * not duplicate it.
+   * @param {string} cwd - workspace root.
+   * @param {string} raw - caller path.
+   * @returns {{path: string}|{error: string}} resolved path or a reason.
+   */
+  function resolveTemplateInput(cwd, raw) {
+    const value = String(raw ?? '').trim()
+    if (value === '') return { error: '模板路径为空' }
+    const absolute = isAbsolute(value) ? value : resolve(cwd, value)
+    if (!existsSync(absolute)) return { error: `模板不存在：${absolute}` }
+    try {
+      if (statSync(absolute).isFile() && /^[\s\S]*\.pptx$/i.test(absolute)) {
+        // `ensureInside` throws when the path escapes the workspace.
+        try {
+          const inside = ensureInside(cwd, absolute)
+          return { path: inside }
+        } catch {
+          /* outside: import below */
+        }
+        const target = join(store.rootOf(cwd), STORE_DIR, '_templates')
+        mkdirSync(target, { recursive: true })
+        const name = `${createHash('sha1').update(absolute).update(String(statSync(absolute).size)).digest('hex').slice(0, 12)}.pptx`
+        const copy = join(target, name)
+        if (!existsSync(copy)) copyFileSync(absolute, copy)
+        log('info', `pptx-studio: 模板来自工作区外，已导入 ${copy}`)
+        return { path: copy, importedFrom: absolute }
+      }
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : String(error) }
+    }
+    return { error: `模板不是 .pptx 文件：${absolute}` }
+  }
+
+  /**
    * Load a deck or answer with a model-actionable failure.
    * @param {Record<string, unknown>} args - tool args.
    * @returns {{entry: import('./lib/store.js').DeckEntry}|{error: Record<string, unknown>}} result.
@@ -913,6 +1019,12 @@ export async function apply(ctx, config = {}) {
     if (/** @type {any} */ (pipeline).builtAt) return null
     const slides = /** @type {any[]} */ (entry.model.slides) || []
     if (slides.length > 0) return null
+    const template = /** @type {any} */ (pipeline).template
+    // Template mode: the requirement cannot be decomposed before we know what
+    // the template actually offers, so decomposition comes first.
+    if (template && template.required === true && !template.decomposedAt) {
+      return fail('stage-template', '先调用 pptx_studio_template 把模板分解成「可复用版式 + 文字槽」（右侧画布会显示每页的角色和能填哪些字段），再写需求分析；确实要跳过就传 force:true。')
+    }
     if (!/** @type {any} */ (pipeline).research) {
       return fail('stage-research', '先用 pptx_studio_research 提交需求分析/调研（画布会显示这一阶段）；确实要跳过流程就传 force:true。')
     }
@@ -963,6 +1075,165 @@ export async function apply(ctx, config = {}) {
   }
 
   /**
+   * Load the decomposed template spec (memory first, then the deck on disk).
+   * @param {import('./lib/store.js').DeckEntry} entry - deck entry.
+   * @returns {Record<string, any>|null} spec.
+   */
+  function templateSpecOf(entry) {
+    const cached = templateSpecs.get(entry.model.id)
+    if (cached) return cached
+    const file = join(entry.dir, TEMPLATE_SPEC_FILE)
+    if (!existsSync(file)) return null
+    try {
+      const spec = normalizeTemplateSpec(JSON.parse(readFileSync(file, 'utf8')), /** @type {any} */ (entry.model.size))
+      if (spec) {
+        templateSpecs.set(entry.model.id, spec)
+        return spec
+      }
+      log('warn', `pptx-studio: ${TEMPLATE_SPEC_FILE} 无法解析，忽略`)
+    } catch (error) {
+      log('warn', `pptx-studio: ${TEMPLATE_SPEC_FILE} 读取失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+    return null
+  }
+
+  /**
+   * Persist a decomposed spec next to the deck.
+   * @param {import('./lib/store.js').DeckEntry} entry - deck entry.
+   * @param {Record<string, any>|null} spec - spec or null to forget.
+   * @returns {void}
+   */
+  function storeTemplateSpec(entry, spec) {
+    if (!spec) templateSpecs.delete(entry.model.id)
+    else templateSpecs.set(entry.model.id, spec)
+    templateSheetCache.delete(entry.model.id)
+    const dir = join(entry.dir, TEMPLATE_DIR)
+    try {
+      if (spec) {
+        mkdirSync(dir, { recursive: true })
+        writeFileSync(join(dir, 'template.json'), JSON.stringify(spec, null, 2), 'utf8')
+      }
+    } catch (error) {
+      log('warn', `pptx-studio: 模板 spec 落盘失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }
+
+  /**
+   * Data URL for one template plate, for the sandboxed HTML sheet.
+   *
+   * The preview iframe runs under `default-src 'none'` with `img-src data:` only,
+   * so images have to travel inside the document; thumbnails (not the full-size
+   * plates) keep that document a few hundred KB instead of tens of MB.
+   * @param {import('./lib/store.js').DeckEntry} entry - deck entry.
+   * @param {Record<string, any>} page - template page.
+   * @returns {string|null} data URL.
+   */
+  function plateDataUrl(entry, page) {
+    const candidates = []
+    if (typeof page.plate === 'string' && page.plate !== '') {
+      const name = page.plate.replace(/\.[A-Za-z0-9]+$/, '')
+      candidates.push(`${name}-thumb.jpg`, `${name}.jpg`, page.plate)
+    }
+    for (const relative of candidates) {
+      const file = join(entry.dir, relative)
+      if (!existsSync(file)) continue
+      const hit = plateCache.get(file)
+      if (hit) return hit
+      try {
+        const bytes = readFileSync(file)
+        // A 1600px plate is ~200KB; the sheet only needs the thumbnail.
+        if (bytes.length > 400 * 1024) continue
+        const mime = /\.jpe?g$/i.test(relative) ? 'image/jpeg' : 'image/png'
+        const url = `data:${mime};base64,${bytes.toString('base64')}`
+        plateCache.set(file, url)
+        return url
+      } catch {
+        /* try the next candidate */
+      }
+    }
+    return null
+  }
+
+  /**
+   * Render (and cache) the HTML sheet for a template-mode preview.
+   * @param {import('./lib/store.js').DeckEntry} entry - deck entry.
+   * @param {Record<string, any>} spec - template spec.
+   * @param {Array<Record<string, any>>} pages - page mapping.
+   * @param {string} [title] - sheet title.
+   * @returns {{html: string, width: number, height: number, missing: number[]}} sheet.
+   */
+  function templateSheet(entry, spec, pages, title) {
+    const key = createHash('sha1').update(JSON.stringify(pages)).update(String(spec.version || '')).digest('hex')
+    const cached = templateSheetCache.get(entry.model.id)
+    if (cached && cached.key === key && cached.html && (title === undefined || cached.title === title)) return cached
+    const sheet = renderTemplateHtml(spec, pages, {
+      designWidth: 1280,
+      title: title ?? 'HTML 模版',
+      readImage: (page) => plateDataUrl(entry, page),
+    })
+    templateSheetCache.set(entry.model.id, { key, html: sheet.html, width: sheet.width, height: sheet.height, title })
+    return sheet
+  }
+
+  /**
+   * The page→copy mapping for a template-mode deck: the explicit preview
+   * mapping when there is one, otherwise the outline the research step wrote.
+   * @param {import('./lib/store.js').DeckEntry} entry - deck entry.
+   * @returns {Array<Record<string, any>>|null} mapping.
+   */
+  function mappingOf(entry) {
+    const preview = /** @type {any} */ (entry.model.pipeline || {}).preview
+    if (preview && preview.mode === 'template' && Array.isArray(preview.pages) && preview.pages.length > 0) {
+      return preview.pages
+    }
+    const research = /** @type {any} */ (entry.model.pipeline || {}).research
+    const outline = Array.isArray(research?.outline) ? research.outline : []
+    const mapped = outline.filter((item) => Number.isInteger(item.templateSlide))
+    if (mapped.length === 0) return null
+    return mapped.map((item) => ({ templateSlide: item.templateSlide, title: item.title || '', fields: item.fields || {} }))
+  }
+
+  /**
+   * Decompose `deck.template.path` into the reusable spec, rendering plates.
+   * @param {import('./lib/store.js').DeckEntry} entry - deck entry.
+   * @param {{pages?: number|null, render?: boolean}} [options] - limits.
+   * @returns {Promise<{spec: Record<string, any>|null, error: string|null, raw: Record<string, any>|null}>} result.
+   */
+  async function decomposeTemplate(entry, options = {}) {
+    const templatePath = /** @type {any} */ (entry.model.template)?.path
+    if (typeof templatePath !== 'string' || templatePath === '') {
+      return { spec: null, error: '这个 deck 没有模板：先用 pptx_studio_open 传 template 建画布。', raw: null }
+    }
+    if (!existsSync(templatePath)) {
+      return { spec: null, error: `模板文件不在了：${templatePath}`, raw: null }
+    }
+    const outDir = join(entry.dir, TEMPLATE_DIR)
+    mkdirSync(outDir, { recursive: true })
+    const args = [templatePath, outDir]
+    const pages = Number.isFinite(options.pages) && /** @type {number} */ (options.pages) > 0 ? Math.floor(/** @type {number} */ (options.pages)) : 0
+    if (pages > 0) args.push('--max-slides', String(pages))
+    if (options.render === false) args.push('--no-render')
+    const raw = await python.run('pptx_template.py', args, { timeoutMs: 360_000 })
+    if (!raw || raw.ok !== true) {
+      const message = raw && typeof raw.error === 'string' ? raw.error : '模板分解未返回结果'
+      return { spec: null, error: message, raw: /** @type {any} */ (raw) }
+    }
+    const spec = normalizeTemplateSpec(raw, /** @type {any} */ (entry.model.size))
+    if (!spec) return { spec: null, error: '模板分解结果不可用（没有解析出任何页）', raw: /** @type {any} */ (raw) }
+    return { spec: /** @type {any} */ (spec), error: null, raw: /** @type {any} */ (raw) }
+  }
+
+  /**
+   * Trim a sample string for a one-line catalogue.
+   * @param {string} value - sample text.
+   * @returns {string} shortened sample.
+   */
+  function shortSample(value) {
+    const text = String(value ?? '').replace(/\s+/g, ' ').trim()
+    return text.length > 14 ? `${text.slice(0, 14)}…` : text
+  }
+
+  /**
    * Default geometry for a title element, using the template's title
    * placeholder when one exists.
    * @param {Record<string, unknown>|null} info - template summary.
@@ -993,6 +1264,192 @@ export async function apply(ctx, config = {}) {
    */
   function emit(entry, event) {
     return store.changed(entry, event)
+  }
+
+  // ── session activity feed ─────────────────────────────────────────────────
+
+  /** Human label of one tool, shown on the canvas progress bar and its card. */
+  const TOOL_LABELS = {
+    pptx_studio_open: '打开画布',
+    pptx_studio_template: '拆解模板',
+    pptx_studio_research: '分析与调研',
+    pptx_studio_preview: '生成 HTML 效果稿',
+    pptx_studio_deck: '更新演示文稿设置',
+    pptx_studio_plan: '规划页面骨架',
+    pptx_studio_slide: '绘制幻灯片',
+    pptx_studio_add_element: '添加元素',
+    pptx_studio_patch: '修改画布',
+    pptx_studio_inspect: '检查画布',
+    pptx_studio_verify: '一致性校验',
+    pptx_studio_export: '导出 PPTX',
+  }
+
+  /**
+   * Per-session feed of the `pptx_studio_*` call in flight. The canvas tab
+   * subscribes to it for one reason: a tab that is showing the previous build
+   * has to learn, the moment a call starts, *which* deck that call writes — and
+   * switch to it — instead of leaving the old pptx on screen while the agent
+   * draws the new one somewhere else.
+   *
+   * @type {Map<string, {task: Record<string, any>|null, listeners: Set<(task: Record<string, any>) => void>}>}
+   */
+  const sessionFeeds = new Map()
+
+  /**
+   * The feed of one session (created on first use).
+   * @param {string} sessionId - session id (`''` for a stateless feed).
+   * @returns {{task: Record<string, any>|null, listeners: Set<(task: Record<string, any>) => void>}} feed.
+   */
+  function feedOf(sessionId) {
+    const key = typeof sessionId === 'string' ? sessionId : ''
+    let feed = sessionFeeds.get(key)
+    if (!feed) {
+      feed = { task: null, listeners: new Set() }
+      if (key !== '') sessionFeeds.set(key, feed)
+    }
+    return feed
+  }
+
+  /**
+   * Publish the current call of one session. `seq` only grows, so a canvas that
+   * reconnects can tell an old snapshot from a new one.
+   * @param {string} sessionId - session id.
+   * @param {Record<string, any>} patch - fields to merge.
+   * @returns {Record<string, any>|null} the published task (null without a session).
+   */
+  function publishTask(sessionId, patch) {
+    if (typeof sessionId !== 'string' || sessionId === '') return null
+    const feed = feedOf(sessionId)
+    const previous = feed.task
+    const now = new Date().toISOString()
+    const next = {
+      sessionId,
+      tool: String(patch.tool ?? previous?.tool ?? ''),
+      label: String(patch.label ?? previous?.label ?? ''),
+      deckId: patch.deckId !== undefined ? String(patch.deckId ?? '') : String(previous?.deckId ?? ''),
+      state: String(patch.state ?? 'running'),
+      message: String(patch.message ?? ''),
+      startedAt: String(patch.startedAt ?? previous?.startedAt ?? now),
+      updatedAt: now,
+      seq: Number(previous?.seq ?? 0) + 1,
+    }
+    feed.task = next
+    for (const listener of [...feed.listeners]) {
+      try {
+        listener(next)
+      } catch {
+        /* a broken subscriber must never break the tool */
+      }
+    }
+    return next
+  }
+
+  /**
+   * Subscribe to one session's feed.
+   * @param {string} sessionId - session id.
+   * @param {(task: Record<string, any>) => void} listener - sink.
+   * @returns {() => void} unsubscribe.
+   */
+  function subscribeTask(sessionId, listener) {
+    const feed = feedOf(sessionId)
+    feed.listeners.add(listener)
+    return () => feed.listeners.delete(listener)
+  }
+
+  /**
+   * Wrap one tool so every call reports its start, its deck and its outcome to
+   * the session feed. Wrapping here (instead of inside each tool) keeps the
+   * progress truthful for all twelve steps, including the ones that only patch
+   * an existing deck.
+   * @param {Record<string, any>} tool - tool definition.
+   * @returns {Record<string, any>} wrapped definition.
+   */
+  function trackedTool(tool) {
+    const label = TOOL_LABELS[tool.name] ?? tool.name
+    return {
+      ...tool,
+      /**
+       * @param {Record<string, any>} args - tool args.
+       * @param {any} exec - execution context.
+       * @returns {Promise<Record<string, unknown>>} receipt.
+       */
+      async execute(args, exec) {
+        const sessionId = String(sessionOf(exec).id ?? '')
+        const hinted = typeof args?.deck === 'string' && args.deck.trim() !== ''
+          ? args.deck.trim()
+          : (typeof args?.deckId === 'string' ? args.deckId.trim() : '')
+        const startedAt = new Date().toISOString()
+        // A new call starts a new task: the deck it names (or a blank one for
+        // `open`, whose deck does not exist yet) is what the canvas must show.
+        publishTask(sessionId, { tool: tool.name, label, deckId: hinted, state: 'running', message: '', startedAt })
+        let result
+        try {
+          result = await tool.execute(args, exec)
+        } catch (error) {
+          publishTask(sessionId, {
+            tool: tool.name,
+            label,
+            state: 'failed',
+            message: error instanceof Error ? error.message : String(error),
+            startedAt,
+          })
+          throw error
+        }
+        const resultDeckId = result && typeof result.deckId === 'string' && result.deckId !== '' ? result.deckId : ''
+        const ok = !(result && result.ok === false)
+        publishTask(sessionId, {
+          tool: tool.name,
+          label,
+          ...(resultDeckId !== '' || hinted !== '' ? { deckId: resultDeckId || hinted } : {}),
+          state: ok ? 'done' : 'failed',
+          message: ok ? '' : String(result?.message ?? result?.code ?? ''),
+          startedAt,
+        })
+        return result
+      },
+    }
+  }
+
+  /**
+   * Stream one session's activity feed (`/api/session/events`).
+   * @param {import('node:http').IncomingMessage} req - request.
+   * @param {import('node:http').ServerResponse} res - response.
+   * @param {string} sessionId - session id.
+   * @returns {void}
+   */
+  function serveSessionEvents(req, res, sessionId) {
+    res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache, no-transform',
+      connection: 'keep-alive',
+      'x-accel-buffering': 'no',
+    })
+    const send = (event) => {
+      try {
+        res.write(`data: ${JSON.stringify(event)}\n\n`)
+      } catch {
+        /* client vanished; the close handler cleans up */
+      }
+    }
+    const sendTask = (task) => send({ type: 'task', task, seq: Number(task?.seq ?? 0) })
+    res.write('retry: 2000\n\n')
+    sendTask(feedOf(sessionId).task)
+    const unsubscribe = subscribeTask(sessionId, sendTask)
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(`: ping ${Date.now()}\n\n`)
+      } catch {
+        /* handled by close */
+      }
+    }, HEARTBEAT_MS)
+    if (typeof heartbeat.unref === 'function') heartbeat.unref()
+    const cleanup = () => {
+      clearInterval(heartbeat)
+      unsubscribe()
+    }
+    req.on('close', cleanup)
+    req.on('error', cleanup)
+    res.on('close', cleanup)
   }
 
   // ── tools ──────────────────────────────────────────────────────────────────
@@ -1027,11 +1484,12 @@ export async function apply(ctx, config = {}) {
       let templatePath = null
       let info = null
       if (typeof args.template === 'string' && args.template.trim() !== '') {
+        const resolved = resolveTemplateInput(root, args.template)
+        if (/** @type {any} */ (resolved).error) {
+          return fail('template-missing', `${/** @type {any} */ (resolved).error}。给一个存在的 .pptx 路径（工作区内或绝对路径都行）。`)
+        }
+        templatePath = /** @type {any} */ (resolved).path
         try {
-          templatePath = workspacePath(root, args.template, '')
-          if (!existsSync(templatePath)) {
-            return fail('template-missing', `模板不存在：${templatePath}。把模板放到工作区目录后再试。`)
-          }
           info = await python.run('pptx_inspect.py', [templatePath])
         } catch (error) {
           return fail('template-unreadable', `模板解析失败：${error instanceof Error ? error.message : String(error)}；可先不传 template 用空白画布。`)
@@ -1054,20 +1512,35 @@ export async function apply(ctx, config = {}) {
           log('warn', `pptx-studio: template.json 写入失败：${error instanceof Error ? error.message : String(error)}`)
         }
       }
+      // Template mode always reports where it is: the first job is decomposing
+      // the template, not writing slides.
+      if (templatePath) {
+        const pipeline = /** @type {any} */ (entry.model.pipeline || normalizePipeline(null))
+        if (!pipeline.template || pipeline.template.path === '') {
+          pipeline.template = { path: templatePath, required: true, decomposedAt: null, pages: 0, engine: '', textHidden: false, design: null }
+        }
+        pipeline.template.required = true
+        entry.model.pipeline = pipeline
+        entry.model.template = { ...(entry.model.template || {}), path: templatePath }
+      }
+      syncPipeline(entry)
       entry.persist()
-      emit(entry, { type: 'deck', deck: entry.model, mode: templatePath ? 'template' : 'blank' })
+      // A resumed deck keeps its template: report the mode from the model, not
+      // from whether this particular call supplied one.
+      const templateMode = Boolean(/** @type {any} */ (entry.model.template)?.path)
+      emit(entry, { type: 'deck', deck: entry.model, mode: templateMode ? 'template' : 'blank' })
       emit(entry, {
         type: 'status',
         phase: 'ready',
         total: /** @type {any[]} */ (entry.model.slides).length,
         message: '画布已就绪',
       })
-      toolLog('open', entry, `template=${templatePath ? 'yes' : 'no'} slides=${/** @type {any[]} */ (entry.model.slides).length}`)
+      toolLog('open', entry, `template=${templateMode ? 'yes' : 'no'} slides=${/** @type {any[]} */ (entry.model.slides).length}`)
       return {
         ok: true,
         deckId: entry.model.id,
         dir: entry.dir,
-        mode: templatePath ? 'template' : 'blank',
+        mode: templateMode ? 'template' : 'blank',
         size: entry.model.size,
         slides: /** @type {any[]} */ (entry.model.slides).length,
         template: info
@@ -1079,8 +1552,117 @@ export async function apply(ctx, config = {}) {
           : null,
         stage: pipelineSummary(entry.model).stage,
         pipeline: pipelineSummary(entry.model),
-        hint: '右侧画布已打开。按流程走：① pptx_studio_research 交需求分析与调研 → ② pptx_studio_preview 交 HTML 效果预览 → ③ pptx_studio_plan / pptx_studio_slide 落成幻灯片 → pptx_studio_export。',
+        hint: templateMode
+          ? '模板模式。按流程走：⓪ pptx_studio_template 分解模板（得到每页版式/角色/可填字段）→ ① pptx_studio_research 做需求分解（outline 每项写 templateSlide + fields）→ ② pptx_studio_preview 自动按同一份映射生成 HTML 模版 → ③ pptx_studio_plan / pptx_studio_slide 传 templateSlide + fields 落成幻灯片 → pptx_studio_verify 校验一致 → pptx_studio_export。'
+          : '右侧画布已打开。按流程走：① pptx_studio_research 交需求分析与调研 → ② pptx_studio_preview 交 HTML 效果预览 → ③ pptx_studio_plan / pptx_studio_slide 落成幻灯片 → pptx_studio_export。',
       }
+    },
+  }
+
+  /**
+   * `pptx_studio_template`: step 0 in template mode — decompose the template.
+   */
+  const templateTool = {
+    name: 'pptx_studio_template',
+    output: { schema: OUTPUT_SCHEMA, render: renderReceipt },
+    description:
+      '模板模式的第一步：把用户给的 .pptx 模板分解成「可复用版式」。结果包含每页的角色（封面/目录/章节/内容/结尾）、去掉原文的干净底图（plate）、以及每页可填的文字字段（id、示例、能放多少字）。这一步也是需求分解的依据：拿到 pages 之后，pptx_studio_research 的 outline 每一项要写 templateSlide 与 fields，把需求落到模板页上。',
+    parameters: {
+      deck: { type: 'string', required: true, description: 'pptx_studio_open 返回的 deckId（建画布时传了 template）。' },
+      pages: { type: 'integer', description: '只分解前 N 页（模板很长时先看一部分）。省略=全部。' },
+      render: { type: 'boolean', description: '是否用 PowerPoint 渲染底图（默认 true）。false 只解析结构，快，但每页没有干净底图。' },
+      list: { type: 'boolean', description: '只读已分解结果，不重新渲染。' },
+    },
+    /**
+     * @param {Record<string, any>} args - tool args.
+     * @param {any} exec - execution context.
+     * @returns {Promise<Record<string, unknown>>} receipt.
+     */
+    async execute(args, exec) {
+      const found = requireDeck(args, exec)
+      if (/** @type {any} */ (found).error) return /** @type {any} */ (found).error
+      const entry = /** @type {any} */ (found).entry
+      const deck = entry.model
+      /** @type {Record<string, any>|null} */
+      let spec = templateSpecOf(entry)
+      const reading = args.list === true
+      if (!spec && reading) {
+        return fail('template-not-decomposed', '还没有分解过模板：先调用 pptx_studio_template（不带 list）分解一次。')
+      }
+      if (!reading) {
+        emit(entry, {
+          type: 'status',
+          phase: 'template',
+          op: 'template',
+          begin: true,
+          message: '正在分解模板：解析版式、提取文字槽、渲染干净底图',
+        })
+        const result = await decomposeTemplate(entry, {
+          pages: Number.isFinite(args.pages) ? Number(args.pages) : null,
+          render: args.render !== false,
+        })
+        if (result.error || !result.spec) {
+          emit(entry, { type: 'status', phase: 'ready', message: '模板分解失败' })
+          return fail('template-decompose-failed', `模板分解失败：${result.error}。可以传 render:false 只解析结构，或检查模板文件是否可被 PowerPoint 打开。`)
+        }
+        spec = result.spec
+        storeTemplateSpec(entry, spec)
+        const pipeline = /** @type {any} */ (syncPipeline(entry))
+        pipeline.template = {
+          path: spec.path || deck.template?.path || '',
+          required: true,
+          decomposedAt: new Date().toISOString(),
+          pages: spec.pages.length,
+          engine: spec.engine,
+          textHidden: Boolean(spec.render?.textHidden),
+          design: {
+            palette: (spec.design?.palette || []).map((/** @type {any} */ e) => e.hex),
+            background: spec.design?.background || '',
+            fonts: spec.design?.fonts || null,
+          },
+        }
+        deck.template = { ...(deck.template || {}), path: spec.path || deck.template?.path, pages: spec.pages.length, decomposedAt: pipeline.template.decomposedAt }
+        // Adopt the template's size and visual language so later slides do not
+        // have to be told the palette or the page geometry again.
+        if (spec.size && (spec.size.w !== deck.size.w || spec.size.h !== deck.size.h)) {
+          deck.size = { w: spec.size.w, h: spec.size.h }
+        }
+        if (spec.design?.background) {
+          const theme = normalizeTheme(deck.theme)
+          theme.colors.background = spec.design.background
+          if (spec.design.palette?.[0]?.hex) theme.colors.accent = spec.design.palette[0].hex
+          if (spec.design.fonts?.body) theme.fonts.ea = spec.design.fonts.body
+          if (spec.design.fonts?.body) theme.fonts.latin = spec.design.fonts.latin || spec.design.fonts.body
+          if (spec.design.fonts?.title) theme.fonts.heading = spec.design.fonts.title
+          deck.theme = theme
+        }
+        deck.pipeline = pipeline
+        emit(entry, pipelineEvent(entry))
+        emit(entry, { type: 'deck', deck, mode: 'template' })
+        emit(entry, { type: 'status', phase: 'ready', message: `模板已分解：${spec.pages.length} 页` })
+        toolLog('template', entry, `pages=${spec.pages.length} engine=${spec.engine}`)
+      }
+      const summary = templateSummary(/** @type {any} */ (spec))
+      const catalogue = templateCatalogue(/** @type {any} */ (spec))
+      /** @type {Record<string, unknown>} */
+      const receipt = {
+        ok: true,
+        deckId: deck.id,
+        stage: /** @type {any} */ (syncPipeline(entry)).stage,
+        template: summary,
+        // One compact line per page is what the model needs to map requirements
+        // onto the template; the full spec (boxes/styles) stays in the canvas.
+        pages: catalogue.map((page) => ({
+          page: page.page,
+          role: page.role,
+          fields: page.fields.map((field) => `${field.id}=${shortSample(field.sample)}（≤${field.maxCjk}字）`).join(' '),
+        })),
+        hint: '下一步 pptx_studio_research：brief.outline 每项写 { title, templateSlide: <上面的 page>, fields: { 字段id: 文案 } }，把需求直接落到模板页上。',
+      }
+      if (!spec?.render?.textHidden) {
+        receipt.warnings = ['底图不是用 PowerPoint 渲染的（没装 PowerPoint 或渲染失败），页面上原有的文字可能没被去掉，成品需要人工核对。']
+      }
+      return receipt
     },
   }
 
@@ -1110,25 +1692,65 @@ export async function apply(ctx, config = {}) {
       const found = requireDeck(args, exec)
       if (/** @type {any} */ (found).error) return /** @type {any} */ (found).error
       const entry = /** @type {any} */ (found).entry
+      // Template mode: the requirement cannot be broken down before the
+      // template has been decomposed, because the mapping needs its pages.
+      const tplPipeline = /** @type {any} */ (entry.model.pipeline || {})
+      if (tplPipeline.template?.required === true && !tplPipeline.template.decomposedAt) {
+        return fail('stage-template', '先调用 pptx_studio_template 分解模板（得到每页角色与可填字段），再把需求映射到模板页上；确实要跳过就换成不带模板的画布。')
+      }
       const brief = normalizeResearch(args.brief)
       if (!brief) return fail('brief-required', 'brief 必须是一个对象；至少给 summary 或 outline。')
       if (brief.summary === '' && brief.outline.length === 0) {
         return fail('brief-empty', 'brief.summary 与 brief.outline 都为空。先写一段分析摘要，并给出每页要讲什么。')
       }
       if (!entry.model.pipeline) entry.model.pipeline = normalizePipeline(null)
+      // Template mode: the brief is also the requirement decomposition, so the
+      // outline has to say which template page each slide reuses. Checking it
+      // here (against the real fields) is what stops a plan from being written
+      // for a template that cannot hold it.
+      const spec = templateSpecOf(entry)
+      if (spec && /** @type {any} */ (entry.model.pipeline).template?.required === true) {
+        const mapped = brief.outline.filter((item) => Number.isInteger(item.templateSlide))
+        if (mapped.length === 0) {
+          return fail('template-mapping-required', '模板模式下 outline 每一项都要写 templateSlide（用模板的哪一页做底版）与 fields（这一页各字段的文案）。先看 pptx_studio_template 返回的 pages，再逐页映射；否则需求没有落到模板上。')
+        }
+        const checked = checkMapping(spec, brief.outline)
+        if (checked.issues.length > 0) {
+          return fail('template-mapping-invalid', `需求分解与模板对不上（${checked.issues.length} 处），先修好再继续：` + checked.issues.slice(0, 8).map((issue) => `\n- ${issue}`).join(''))
+        }
+        brief.outline = brief.outline.map((item, index) => {
+          const page = checked.pages[index]
+          return page ? { ...item, templateSlide: page.templateSlide, fields: page.fields } : item
+        })
+        if (checked.warnings.length > 0) {
+          log('info', `pptx-studio: 需求分解提醒 ${checked.warnings.length} 条：${checked.warnings[0]}`)
+        }
+      }
       entry.model.pipeline.research = brief
       syncPipeline(entry)
       emit(entry, pipelineEvent(entry))
       toolLog('research', entry, `outline=${brief.outline.length} sources=${brief.sources.length}`)
-      return {
+      /** @type {Record<string, unknown>} */
+      const receipt = {
         ok: true,
         deckId: entry.model.id,
         stage: /** @type {any} */ (entry.model.pipeline).stage,
         outline: brief.outline.length,
         facts: brief.facts.length,
         sources: brief.sources.length,
-        hint: '第二步：用 pptx_studio_preview 提交自包含 HTML 效果预览（每页一个 .slide、内联 CSS；画布会直接用 iframe 显示）。用户确认视觉方向后，再用 pptx_studio_plan / pptx_studio_slide 落成 PPTX。',
+        hint: spec
+          ? '第二步：pptx_studio_preview 只需传 pages:false 或直接调它——模板模式下 HTML 模版会按 outline 的 templateSlide/fields 自动生成（同一份映射，幻灯片会照着它建）。'
+          : '第二步：用 pptx_studio_preview 提交自包含 HTML 效果预览（每页一个 .slide、内联 CSS；画布会直接用 iframe 显示）。用户确认视觉方向后，再用 pptx_studio_plan / pptx_studio_slide 落成 PPTX。',
       }
+      if (spec) {
+        const checked = checkMapping(spec, brief.outline)
+        receipt.templateMapping = {
+          pages: brief.outline.length,
+          templateSlides: brief.outline.map((item) => item.templateSlide ?? null),
+        }
+        if (checked.warnings.length > 0) receipt.warnings = checked.warnings.slice(0, 10)
+      }
+      return receipt
     },
   }
 
@@ -1142,7 +1764,13 @@ export async function apply(ctx, config = {}) {
       '生成 PPTX 的第二步：提交一份自包含 HTML 视觉稿（每页一个 .slide，尺寸与 deck 一致，内联 CSS，不依赖外部脚本）。画布会用沙箱 iframe 把它渲染出来，并按 width/height 缩放适配侧栏，让用户在生成 PPTX 前先确认效果。提交后流程进入「幻灯片」阶段。',
     parameters: {
       deck: { type: 'string', required: true, description: 'deckId。' },
-      html: { type: 'string', required: true, description: '完整的 HTML 文档（含 <style>），内联样式优先；不要用外部脚本。' },
+      html: { type: 'string', description: '完整的 HTML 文档（含 <style>），内联样式优先；不要用外部脚本。模板模式下不需要（传了就以它为准）。' },
+      pages: {
+        type: 'array',
+        description: '模板模式：逐页映射 [{templateSlide, title?, fields:{字段id:文案}}]。省略时用 pptx_studio_research 里 outline 的 templateSlide/fields（推荐，两边同一份数据）。',
+        items: { type: 'object', additionalProperties: true },
+      },
+      fromDeck: { type: 'boolean', description: '模板模式：用幻灯片现在的文字重建映射（画布上手工改过文字后，用它把 HTML 模版同步过来）。' },
       title: { type: 'string', description: '这份视觉稿的标题。' },
       notes: { type: 'string', description: '设计说明：配色、字体、版式意图。' },
       width: { type: 'integer', description: '视觉稿设计画布宽度（px），例如 960 或 1280；省略时画布从 HTML 或 deck 尺寸推断。' },
@@ -1156,7 +1784,69 @@ export async function apply(ctx, config = {}) {
       const found = requireDeck(args, exec)
       if (/** @type {any} */ (found).error) return /** @type {any} */ (found).error
       const entry = /** @type {any} */ (found).entry
-      const html = typeof args.html === 'string' ? args.html : ''
+      const deck = entry.model
+      const rawHtml = typeof args.html === 'string' ? args.html : ''
+      const spec = templateSpecOf(entry)
+      if (!entry.model.pipeline) entry.model.pipeline = normalizePipeline(null)
+      // ── template mode: the sheet is generated from the same mapping the
+      // slides will be built from, so HTML and PPTX cannot drift apart. ──────
+      if (spec) {
+        // `fromDeck` is the "I edited the slides, sync the sheet" switch: the
+        // mapping is read back out of the deck's own element provenance.
+        const deckPages = args.fromDeck === true
+          ? pagesFromDeck(deck).map((page) => ({ templateSlide: page.page, title: '', fields: page.fields }))
+          : null
+        const provided = deckPages && deckPages.length > 0
+          ? deckPages
+          : (Array.isArray(args.pages) && args.pages.length > 0
+            ? args.pages.map((item) => {
+              const one = item !== null && typeof item === 'object' ? /** @type {Record<string, any>} */ (item) : {}
+              return { templateSlide: Number(one.templateSlide) || 0, title: typeof one.title === 'string' ? one.title : '', fields: normalizeFill(one.fields) }
+            })
+            : mappingOf(entry))
+        if (!provided || provided.length === 0) {
+          return fail('preview-mapping-required', '模板模式需要 pages（或用 pptx_studio_research 的 outline 自带 templateSlide/fields）。先做需求分解：每页指定用模板的哪一页、各字段写什么。')
+        }
+        const bad = provided.filter((page) => !templatePage(spec, page.templateSlide))
+        if (bad.length > 0) {
+          return fail('preview-bad-page', `这些页引用了模板里不存在的页：${bad.map((page) => page.templateSlide).join(',')}（模板共 ${spec.pages.length} 页）。`)
+        }
+        const sheet = templateSheet(entry, spec, provided, typeof args.title === 'string' ? args.title : '')
+        if (sheet.missing.length > 0) {
+          return fail('preview-missing-plate', `模板第 ${sheet.missing.join(',')} 页没有底图（分解时没渲染成功）；传 render:true 重新跑 pptx_studio_template。`)
+        }
+        const preview = normalizePreview({
+          mode: 'template',
+          pages: provided,
+          title: typeof args.title === 'string' ? args.title : 'HTML 模版',
+          notes: args.notes,
+          width: sheet.width,
+          height: sheet.height,
+        })
+        if (!preview) return fail('preview-required', '模板映射为空。')
+        entry.model.pipeline.preview = preview
+        syncPipeline(entry)
+        if (preview.title && entry.model.title === '未命名演示文稿') entry.model.title = preview.title
+        try {
+          writeFileSync(previewFile(entry), sheet.html, 'utf8')
+        } catch (error) {
+          return fail('preview-write-failed', `预览已存进模型，但写 preview.html 失败：${error instanceof Error ? error.message : String(error)}`)
+        }
+        emit(entry, pipelineEvent(entry))
+        toolLog('preview', entry, `mode=template pages=${provided.length}`)
+        return {
+          ok: true,
+          deckId: entry.model.id,
+          mode: 'template',
+          stage: /** @type {any} */ (entry.model.pipeline).stage,
+          pages: provided.length,
+          templateSlides: provided.map((page) => page.templateSlide),
+          previewBytes: Buffer.byteLength(sheet.html, 'utf8'),
+          path: previewFile(entry),
+          hint: 'HTML 模版已按模板底图 + 同一份字段映射生成（画布「② HTML」可直接看）。第三步：pptx_studio_plan 用同一顺序列页，再 pptx_studio_slide 传 templateSlide + fields 逐页落成幻灯片；最后 pptx_studio_verify 校验一致性后 export。',
+        }
+      }
+      const html = rawHtml
       if (html.trim() === '') return fail('preview-required', 'html 不能为空；给一份完整的 HTML 文档。')
       const bytes = Buffer.byteLength(html, 'utf8')
       if (bytes > MAX_PREVIEW_HTML) {
@@ -1164,7 +1854,6 @@ export async function apply(ctx, config = {}) {
       }
       const preview = normalizePreview({ html, title: args.title, notes: args.notes, width: args.width, height: args.height })
       if (!preview) return fail('preview-required', 'html 不能为空。')
-      if (!entry.model.pipeline) entry.model.pipeline = normalizePipeline(null)
       entry.model.pipeline.preview = preview
       syncPipeline(entry)
       if (preview.title && entry.model.title === '未命名演示文稿') entry.model.title = preview.title
@@ -1264,6 +1953,7 @@ export async function apply(ctx, config = {}) {
           properties: {
             title: { type: 'string', required: true, description: '这页的标题/主题。' },
             intent: { type: 'string', description: '这页要讲什么（只用于画布提示，不进 PPT 正文）。' },
+            templateSlide: { type: 'integer', description: '模板模式：这页用模板第几页做底版（通常与 research outline 的映射一致）。' },
           },
         },
       },
@@ -1284,6 +1974,7 @@ export async function apply(ctx, config = {}) {
       if (planned.length === 0) return fail('empty-plan', 'slides 至少要有一页 {title}。')
       const deck = entry.model
       const info = templateOf(entry)
+      const planSpec = templateSpecOf(entry)
       /** @type {any[]} */
       const slides = []
       // Announce the outline first: the canvas shows "laying out N pages", then
@@ -1298,10 +1989,20 @@ export async function apply(ctx, config = {}) {
       })
       for (const [index, item] of planned.entries()) {
         const title = String(item?.title ?? `第 ${index + 1} 页`)
-        const slide = normalizeSlide(
-          { id: `s${index + 1}`, title, elements: [titleElement(info, deck, title)] },
-          { index, slideW: deck.size.w, slideH: deck.size.h },
-        )
+        // Template mode: a skeleton is a placeholder for a template page, so it
+        // gets the template page's provenance and *no* invented title box — an
+        // off-template element here would have to be cleaned up later and would
+        // show up as an inconsistency.
+        const templateSlide = Number.isInteger(item?.templateSlide) ? item.templateSlide : mappingOf(entry)?.[index]?.templateSlide
+        const slide = planSpec
+          ? normalizeSlide(
+            { id: `s${index + 1}`, title, templateSlide, elements: [] },
+            { index, slideW: deck.size.w, slideH: deck.size.h },
+          )
+          : normalizeSlide(
+            { id: `s${index + 1}`, title, elements: [titleElement(info, deck, title)] },
+            { index, slideW: deck.size.w, slideH: deck.size.h },
+          )
         if (item?.intent) slide.intent = String(item.intent).slice(0, 300)
         slides.push(slide)
         deck.slides = slides.slice()
@@ -1331,11 +2032,21 @@ export async function apply(ctx, config = {}) {
     parameters: {
       deck: { type: 'string', required: true, description: 'deckId。' },
       index: { type: 'number', required: true, description: '页码，从 1 开始；超出当前页数则追加。' },
+      templateSlide: { type: 'integer', description: '模板模式：这一页用模板第几页做底版（pptx_studio_template 返回的 page 编号）。传了就按模板字段建页，不需要自己写 elements。' },
+      fields: {
+        type: 'object',
+        additionalProperties: true,
+        description: '模板模式：字段文案 {字段id: 文本}。字段 id 来自 pptx_studio_template 的 pages（如 title/subtitle/body1）；位置和字号由模板决定，不会跑版。',
+      },
+      extra: {
+        type: 'array',
+        description: '模板模式：在模板字段之外额外加的图元（图表/图片/表格等），坐标照常写英寸。',
+        items: ELEMENT_SCHEMA,
+      },
       slide: {
         type: 'object',
-        required: true,
         additionalProperties: true,
-        description: '整页模型：{ title?, layoutIndex?, notes?, hidden?, background?:{color}, transition?:{type,speed,direction,advanceOnClick,advanceAfterMs}, elements:[...] }，元素用英寸坐标 box=[x,y,w,h]。',
+        description: '整页模型：{ title?, layoutIndex?, notes?, hidden?, background?:{color}, transition?:{type,speed,direction,advanceOnClick,advanceAfterMs}, elements:[...] }，元素用英寸坐标 box=[x,y,w,h]。模板模式下可只写 notes/transition/hidden 等页面设置。',
         properties: {
           title: { type: 'string', description: '页标题（画布用）。' },
           notes: { type: 'string', description: '演讲者备注。' },
@@ -1369,9 +2080,52 @@ export async function apply(ctx, config = {}) {
       const index = oneBased - 1
       if (oneBased > MAX_SLIDES) return fail('too-many-slides', `最多 ${MAX_SLIDES} 页。`)
       const raw = args.slide !== null && typeof args.slide === 'object' ? args.slide : {}
-      const issues = auditSlide(raw)
+      // ── template mode: geometry comes from the template page, copy comes
+      // from `fields`. The caller cannot specify a box, so a slide built here
+      // cannot drift from the page it claims to be. ───────────────────────────
+      const spec = templateSpecOf(entry)
+      const templateSlideIndex = Number.isInteger(args.templateSlide) ? Number(args.templateSlide) : null
+      /** @type {Record<string, any>} */
+      let slideSource = raw
+      /** @type {string[]} */
+      let templateIssues = []
+      if (spec && (templateSlideIndex !== null || args.fields)) {
+        if (templateSlideIndex === null) {
+          return fail('template-slide-required', '模板模式下传了 fields 就要同时传 templateSlide（用模板的哪一页做底版）。')
+        }
+        const built = buildSlideFromTemplate(spec, templateSlideIndex, normalizeFill(args.fields), {
+          slideId: slides[index]?.id ?? `s${oneBased}`,
+          extra: Array.isArray(args.extra) ? args.extra : [],
+        })
+        if (built.slide.elements.length === 0) {
+          const reasons = built.issues.length > 0
+            ? `原因：` + built.issues.slice(0, 6).map((issue) => `
+- ${issue}`).join('')
+            : '先确认 pptx_studio_template 分解成功（页有底图或字段）。'
+          return fail('template-slide-empty', `模板第 ${templateSlideIndex} 页没有生成任何元素，这一页不会被写入。${reasons}`)
+        }
+        slideSource = {
+          ...raw,
+          elements: built.slide.elements,
+          templateSlide: built.slide.templateSlide,
+        }
+        if (raw.elements !== undefined) {
+          log('warn', 'pptx-studio: 模板模式下忽略了手写的 slide.elements（位置由模板决定）；要额外加图元请用 extra。')
+        }
+        if (built.issues.length > 0) {
+          log('info', `pptx-studio: 模板第 ${templateSlideIndex} 页填页提醒 ${built.issues.length} 条：${built.issues[0]}`)
+        }
+        templateIssues = built.issues
+      }
+      // Fail-closed on data errors: a malformed slide would otherwise be
+      // silently repaired into a plausible-looking-but-wrong page.
+      const graded = collectSlideIssues(slideSource, { w: deck.size.w, h: deck.size.h })
+      if (graded.errors.length > 0) {
+        return fail('invalid-data', `第 ${index + 1} 页有 ${graded.errors.length} 处数据错误，已拒绝写入（deck 未被改动）：\n- ${graded.errors.slice(0, 8).join('\n- ')}${graded.errors.length > 8 ? `\n……另有 ${graded.errors.length - 8} 条` : ''}`)
+      }
+      const issues = graded.warnings
       const incoming = normalizeSlide(
-        { ...raw, id: slides[index]?.id ?? `s${oneBased}` },
+        { ...slideSource, id: slides[index]?.id ?? `s${oneBased}` },
         { index, slideW: deck.size.w, slideH: deck.size.h },
       )
       const total = slides[index] ? slides.length : slides.length + 1
@@ -1404,7 +2158,9 @@ export async function apply(ctx, config = {}) {
         total: slides.length,
       }
       // Only present when non-empty: the registry's snapshot rule rejects `undefined`.
-      if (issues.length > 0) receipt.issues = issues
+      const notes = [...issues, ...templateIssues]
+      if (notes.length > 0) receipt.issues = notes
+      if (incoming.templateSlide !== undefined) receipt.templateSlide = incoming.templateSlide
       return receipt
     },
   }
@@ -1436,7 +2192,11 @@ export async function apply(ctx, config = {}) {
       const deck = entry.model
       const slide = /** @type {any[]} */ (deck.slides).find((s) => s.id === args.slideId)
       if (!slide) return fail('slide-not-found', `没有这一页：${args.slideId}；先用 pptx_studio_inspect 看现有 slideId。`)
-      const issues = auditElement(args.element, slide.elements.length)
+      const graded = collectElementIssues(args.element, slide.elements.length, { w: deck.size.w, h: deck.size.h })
+      if (graded.errors.length > 0) {
+        return fail('invalid-data', `新元素有 ${graded.errors.length} 处数据错误，已拒绝追加（deck 未被改动）：\n- ${graded.errors.slice(0, 8).join('\n- ')}${graded.errors.length > 8 ? `\n……另有 ${graded.errors.length - 8} 条` : ''}`)
+      }
+      const issues = graded.warnings
       const el = normalizeElement(args.element, {
         index: slide.elements.length,
         slideW: deck.size.w,
@@ -1502,6 +2262,19 @@ export async function apply(ctx, config = {}) {
         patch: args.patch !== null && typeof args.patch === 'object' ? args.patch : {},
         remove: args.remove === true,
       }
+      // Pre-audit the merged element: patch merges one level deep (chart is
+      // replaced wholesale), so a mistyped chart field would land silently.
+      if (!change.remove) {
+        const slide = /** @type {any[]} */ (deck.slides).find((item) => item.id === change.slideId)
+        const at = slide ? slide.elements.findIndex((item) => item.id === change.elementId) : -1
+        if (slide && at >= 0) {
+          const merged = mergeElement(slide.elements[at], change.patch)
+          const graded = collectElementIssues(merged, at, { w: deck.size.w, h: deck.size.h })
+          if (graded.errors.length > 0) {
+            return fail('invalid-data', `这次 patch 有 ${graded.errors.length} 处数据错误，已拒绝（deck 未被改动）：\n- ${graded.errors.slice(0, 8).join('\n- ')}${graded.errors.length > 8 ? `\n……另有 ${graded.errors.length - 8} 条` : ''}`)
+          }
+        }
+      }
       const result = applyElementPatch(deck, change)
       if (!result.ok) return fail('patch-failed', result.error || 'patch failed')
       emit(entry, {
@@ -1512,7 +2285,17 @@ export async function apply(ctx, config = {}) {
         removed: result.removed === true,
       })
       toolLog('patch', entry, `el=${change.elementId} removed=${result.removed === true}`)
-      return { ok: true, deckId: deck.id, slideId: change.slideId, elementId: change.elementId, removed: result.removed === true, element: result.element ?? null }
+      /** @type {Record<string, unknown>} */
+      const patchReceipt = { ok: true, deckId: deck.id, slideId: change.slideId, elementId: change.elementId, removed: result.removed === true, element: result.element ?? null }
+      // Name what the merge repaired, so the caller can see it happened.
+      const after = result.element
+      if (after && !change.remove) {
+        const slide = /** @type {any[]} */ (deck.slides).find((item) => item.id === change.slideId)
+        const at = slide ? slide.elements.findIndex((item) => item.id === change.elementId) : -1
+        const graded = collectElementIssues(after, at >= 0 ? at : 0, { w: deck.size.w, h: deck.size.h })
+        if (graded.warnings.length > 0) patchReceipt.issues = graded.warnings
+      }
+      return patchReceipt
     },
   }
 
@@ -1545,13 +2328,33 @@ export async function apply(ctx, config = {}) {
    * @param {import('./lib/store.js').DeckEntry} entry - deck entry.
    * @param {string|undefined} target - optional output path (workspace relative or absolute inside workspace).
    * @param {string|null} templatePath - template to inherit master/layouts.
+   * @param {string|undefined} directory - optional absolute folder the user picked in the Host's own directory picker; when set it wins over `target` and the file is named after the deck (never overwriting).
    * @returns {Promise<Record<string, unknown>>} export receipt.
    */
-  async function exportDeck(entry, target, templatePath) {
+  async function exportDeck(entry, target, templatePath, directory) {
+    // Gate the export on a clean deck: the .pptx is the deliverable, so it is
+    // the last place a data mistake is allowed to slip through.
+    const audit = auditDeck(entry.model)
+    if (audit.errors.length > 0) {
+      return fail('invalid-data', `deck 有 ${audit.errors.length} 处数据错误，拒绝导出（修好再导，文件未被写出）：\n- ${audit.errors.slice(0, 8).join('\n- ')}${audit.errors.length > 8 ? `\n……另有 ${audit.errors.length - 8} 条` : ''}`)
+    }
+    // Template mode: the .pptx is supposed to look like the template and say
+    // what the HTML sheet says. Name the drift instead of shipping a file that
+    // quietly disagrees with what the user approved on screen.
+    const specForExport = templateSpecOf(entry)
+    const consistency = specForExport ? previewConsistency(entry.model, /** @type {any} */ (entry.model.pipeline?.preview)) : []
+    if (consistency.length > 0) {
+      return fail('template-inconsistent', `幻灯片与 HTML 模版/模板有 ${consistency.length} 处不一致，拒绝导出（文件未被写出）。先 pptx_studio_verify 看全部问题：` + consistency.slice(0, 6).map((issue) => `
+- ${issue}`).join(''))
+    }
     entry.persist()
     const deckFile = join(entry.dir, 'deck.json')
     let out = join(entry.dir, 'deck.pptx')
-    if (typeof target === 'string' && target.trim() !== '') {
+    if (typeof directory === 'string' && directory.trim() !== '') {
+      // A folder the user chose in the Host picker: this is the one export path
+      // that deliberately leaves the workspace (and the store) behind.
+      out = uniquePptxTarget(directory.trim(), entry.model.title)
+    } else if (typeof target === 'string' && target.trim() !== '') {
       out = workspacePath(entry.cwd, target, '')
       if (extname(out).toLowerCase() !== '.pptx') out = `${out}.pptx`
     }
@@ -1570,8 +2373,13 @@ export async function apply(ctx, config = {}) {
       shapes: info.shapes,
       features: info.features ?? {},
     })
+    // Anything the python side failed to render, plus anything the audit
+    // merely warned about, is named here instead of vanishing into stderr.
+    const warnings = [...audit.warnings, ...(Array.isArray(info.warnings) ? info.warnings : [])]
+    if (warnings.length > 0) log('warn', `pptx-studio: 导出带 ${warnings.length} 条警告：${warnings[0]}`)
     log('info', `pptx-studio: 导出 ${info.path}（${info.slides} 页 / ${info.bytes} 字节）`)
-    return {
+    /** @type {Record<string, unknown>} */
+    const receipt = {
       ok: true,
       deckId: entry.model.id,
       path: info.path,
@@ -1581,8 +2389,112 @@ export async function apply(ctx, config = {}) {
       features: info.features ?? {},
       pipeline: pipelineSummary(entry.model),
       seq: event.seq,
-      hint: '用 present 或让用户在文件卡片里打开这个 .pptx；画布与此文件同源。',
+      hint: warnings.length > 0
+        ? '已导出，但有警告（见 warnings）：画布与此文件同源。'
+        : '用 present 或让用户在文件卡片里打开这个 .pptx；画布与此文件同源。',
     }
+    if (warnings.length > 0) receipt.warnings = warnings.slice(0, 20)
+    return receipt
+  }
+
+  /**
+   * `pptx_studio_verify`: does the deck still match its HTML sheet and template?
+   */
+  const verifyTool = {
+    name: 'pptx_studio_verify',
+    output: { schema: OUTPUT_SCHEMA, render: renderReceipt },
+    description:
+      '一致性校验：检查每一页是否还贴在它声称的模板页上（底图、字段位置），以及幻灯片文字是否与「② HTML 模版」里写的完全一致。模板模式下导出前建议先跑它；返回 ok:false 时按 issues 逐条修（改 preview 或重写对应页），不要直接导出。',
+    parameters: {
+      deck: { type: 'string', required: true, description: 'deckId。' },
+    },
+    /**
+     * @param {Record<string, any>} args - tool args.
+     * @param {any} exec - execution context.
+     * @returns {Promise<Record<string, unknown>>} receipt.
+     */
+    async execute(args, exec) {
+      const found = requireDeck(args, exec)
+      if (/** @type {any} */ (found).error) return /** @type {any} */ (found).error
+      const entry = /** @type {any} */ (found).entry
+      const deck = entry.model
+      const spec = templateSpecOf(entry)
+      const slides = /** @type {any[]} */ (deck.slides)
+      /** @type {string[]} */
+      const issues = []
+      /** @type {string[]} */
+      const warnings = []
+      if (slides.length === 0) {
+        return fail('nothing-to-verify', '还没有任何幻灯片可以校验：先 pptx_studio_plan + pptx_studio_slide。')
+      }
+      if (spec) {
+        issues.push(...previewConsistency(deck, /** @type {any} */ (deck.pipeline?.preview)))
+        for (const [index, slide] of slides.entries()) {
+          if (!Number.isInteger(slide.templateSlide)) {
+            issues.push(`第 ${index + 1} 页没有 templateSlide：这一页不是从模板建的，和模板长相会不一致（模板模式下每页都应用 pptx_studio_slide 传 templateSlide 建）`)
+            continue
+          }
+          const page = templatePage(spec, slide.templateSlide)
+          if (!page) {
+            issues.push(`第 ${index + 1} 页引用模板第 ${slide.templateSlide} 页，但模板里没有这一页`)
+            continue
+          }
+          const plate = slide.elements.find((/** @type {any} */ el) => el.field === '__plate')
+          const renderAvailable = spec.render?.ok === true
+          if (!plate) {
+            // Without a PowerPoint render there is no plate to inherit; that is
+            // a degradation the receipt already reported, not a mistake here.
+            const message = `第 ${index + 1} 页没有模板底图元素（field=__plate）——导出后这一页会缺少背景与装饰`
+            if (renderAvailable) issues.push(message)
+            else warnings.push(`第 ${index + 1} 页用的是纯色底：模板没有渲染底图（没装 PowerPoint），成品背景是近似`)
+          } else if (page.plate && plate.src !== page.plate) {
+            issues.push(`第 ${index + 1} 页底图用的是 ${plate.src}，模板第 ${slide.templateSlide} 页的底图是 ${page.plate}`)
+          }
+          // Field boxes must come from the template, not from a hand edit.
+          const byField = new Map(page.fields.map((/** @type {any} */ field) => [field.id, field]))
+          for (const element of slide.elements) {
+            if (typeof element.field !== 'string' || element.field === '__plate') continue
+            const field = byField.get(element.field)
+            if (!field) {
+              issues.push(`第 ${index + 1} 页有字段 ${element.field}，模板第 ${slide.templateSlide} 页没有这个字段`)
+              continue
+            }
+            const drift = Math.max(...element.box.map((v, i) => Math.abs(Number(v) - Number(field.box[i]))))
+            if (drift > 0.06) {
+              warnings.push(`第 ${index + 1} 页字段 ${element.field} 的位置被改过（偏离模板 ${Math.round(drift * 100) / 100}in）`)
+            }
+            if (element.style?.size && Math.abs(element.style.size - field.style.size) > 1) {
+              warnings.push(`第 ${index + 1} 页字段 ${element.field} 字号 ${element.style.size}pt，模板是 ${field.style.size}pt`)
+            }
+          }
+          const emptyRequired = page.fields.filter((/** @type {any} */ field) => field.sample.trim() !== ''
+            && !slide.elements.some((/** @type {any} */ el) => el.field === field.id))
+          if (emptyRequired.length > 0) {
+            warnings.push(`第 ${index + 1} 页这些字段没填（会留空）：${emptyRequired.map((/** @type {any} */ f) => f.id).join('/')}`)
+          }
+        }
+      } else if (deck.pipeline?.preview?.mode === 'template') {
+        issues.push('deck 记录了模板模式的预览，但读不到模板 spec（template/template.json 丢失）；重新跑 pptx_studio_template。')
+      }
+      const consistent = issues.length === 0
+      toolLog('verify', entry, `consistent=${consistent} issues=${issues.length}`)
+      /** @type {Record<string, unknown>} */
+      const receipt = {
+        ok: consistent,
+        deckId: deck.id,
+        consistent,
+        slides: slides.length,
+        templateMode: Boolean(spec),
+        issues: issues.slice(0, 30),
+        warnings: warnings.slice(0, 20),
+        hint: consistent
+          ? '一致性没问题，可以 pptx_studio_export。'
+          : '按 issues 修：文字不一致就先 pptx_studio_preview 更新映射再重写那页；位置/底图偏了就 pptx_studio_slide 用 templateSlide 重建该页。',
+      }
+      if (consistent) delete receipt.issues
+      if (warnings.length === 0) delete receipt.warnings
+      return receipt
+    },
   }
 
   /**
@@ -1623,9 +2535,11 @@ export async function apply(ctx, config = {}) {
    * Register every tool exactly once, disposed with the plugin.
    */
   const defineTool = await loadDefineTool(ctx, log)
-  const toolDefs = [openTool, researchTool, previewTool, deckTool, planTool, slideTool, addElementTool, patchTool, inspectTool, exportTool]
+  const toolDefs = [openTool, templateTool, researchTool, previewTool, deckTool, planTool, slideTool, addElementTool, patchTool, inspectTool, verifyTool, exportTool]
   for (const tool of toolDefs) {
-    const defined = defineTool(tool)
+    // Every call is tracked: the canvas subscribes to the feed so it can switch
+    // to the deck a running call writes (and say which step is running).
+    const defined = defineTool(trackedTool(tool))
     ctx.effect(() => ctx.tools.register(defined), `pptx-studio: ${tool.name}`)
   }
 
@@ -1651,6 +2565,21 @@ export async function apply(ctx, config = {}) {
     } catch {
       return false
     }
+  }
+
+  /**
+   * Refuse a save folder before the export tries to write into it.
+   * @param {string} directory - absolute folder the caller asked for.
+   * @returns {string|null} the reason it cannot be used, or null when it can.
+   */
+  function directoryRefusal(directory) {
+    if (!isAbsolute(directory)) return `保存目录必须是绝对路径：${directory}`
+    try {
+      if (!statSync(directory).isDirectory()) return `保存位置不是目录：${directory}`
+    } catch (error) {
+      return `保存目录不存在或无法访问：${directory}（${error instanceof Error ? error.message : String(error)}）`
+    }
+    return null
   }
 
   /**
@@ -1849,6 +2778,11 @@ export async function apply(ctx, config = {}) {
       // workspace `assets/` folder cannot shadow the deck's own image.
       candidates.push(resolve(entry.dir, value))
       candidates.push(resolve(entry.cwd, value))
+    } else if (value.startsWith('template/') || value.startsWith('./template/')) {
+      // Template plates live under `<deck>/template/…` (this deck's own copy),
+      // so that prefix resolves against the deck directory first.
+      candidates.push(resolve(entry.dir, value))
+      candidates.push(resolve(entry.cwd, value))
     } else {
       candidates.push(resolve(entry.cwd, value))
     }
@@ -1972,10 +2906,20 @@ export async function apply(ctx, config = {}) {
   async function serveDownload(res, entry) {
     const file = join(entry.dir, 'deck.pptx')
     if (!existsSync(file)) {
+      let receipt = null
       try {
-        await exportDeck(entry, undefined, entry.model.template?.path ?? null)
+        receipt = await exportDeck(entry, undefined, entry.model.template?.path ?? null)
       } catch (error) {
         writeJson(res, 500, { ok: false, code: 'export-failed', message: error instanceof Error ? error.message : String(error) })
+        return
+      }
+      // The gate refuses bad data with a receipt, not a throw: surface it.
+      if (!receipt || receipt.ok !== true) {
+        writeJson(res, 500, {
+          ok: false,
+          code: String(receipt?.code || 'export-failed'),
+          message: String(receipt?.hint || '导出被数据校验拒绝'),
+        })
         return
       }
     }
@@ -2018,6 +2962,45 @@ export async function apply(ctx, config = {}) {
           try {
             if (head === 'health' && req.method === 'GET') {
               writeJson(res, 200, { ok: true, name: 'dsh-pptx-studio', decks: store.decks.size, skills: skillState.skills })
+              return
+            }
+            // The canvas opens before the deck exists. This feed tells it which
+            // deck the running call writes (and which step it is), so the tab
+            // switches instead of showing the previous build.
+            if (head === 'session' && parts[1] === undefined && req.method === 'GET') {
+              const sessionId = url.searchParams.get('sessionId') ?? ''
+              writeJson(res, 200, { ok: true, sessionId, task: feedOf(sessionId).task })
+              return
+            }
+            if (head === 'session' && parts[1] === 'events' && req.method === 'GET') {
+              serveSessionEvents(req, res, url.searchParams.get('sessionId') ?? '')
+              return
+            }
+            if (head === 'template' && req.method === 'GET') {
+              const entry = entryFor(url.searchParams.get('deck') ?? '', {
+                sessionId: url.searchParams.get('sessionId') ?? '',
+                cwd: url.searchParams.get('cwd') ?? '',
+              })
+              if (!entry) {
+                writeJson(res, 404, { ok: false, code: 'deck-not-found' })
+                return
+              }
+              const spec = templateSpecOf(entry)
+              if (!spec) {
+                writeJson(res, 404, { ok: false, code: 'template-missing', hint: '先跑 pptx_studio_template 分解模板。' })
+                return
+              }
+              // The canvas renders the template catalogue (roles + fields) and
+              // the page plates; it never needs the full spec with styles.
+              writeJson(res, 200, {
+                ok: true,
+                summary: templateSummary(spec),
+                size: spec.size,
+                design: spec.design,
+                families: spec.families,
+                pages: templateCatalogue(spec),
+                mapping: mappingOf(entry),
+              })
               return
             }
             if (head === 'decks' && req.method === 'GET') {
@@ -2127,11 +3110,23 @@ export async function apply(ctx, config = {}) {
                 return
               }
               const preview = /** @type {any} */ (entry.model.pipeline)?.preview
-              if (!preview || typeof preview.html !== 'string' || preview.html.trim() === '') {
+              // Template mode stores only the page→copy mapping; the sheet is
+              // generated from the template spec on demand, so it can never be
+              // stale relative to the mapping that slides are built from.
+              let previewHtml = preview && typeof preview.html === 'string' ? preview.html : ''
+              if (preview && preview.mode === 'template') {
+                const spec = templateSpecOf(entry)
+                if (!spec || !Array.isArray(preview.pages)) {
+                  writeJson(res, 404, { ok: false, code: 'template-missing', hint: '模板 spec 不见了，重新跑 pptx_studio_template。' })
+                  return
+                }
+                previewHtml = templateSheet(entry, spec, preview.pages, preview.title).html
+              }
+              if (!preview || previewHtml.trim() === '') {
                 writeJson(res, 404, { ok: false, code: 'preview-missing', hint: '先调用 pptx_studio_preview 提交 HTML 效果。' })
                 return
               }
-              const body = Buffer.from(preview.html, 'utf8')
+              const body = Buffer.from(previewHtml, 'utf8')
               const download = url.searchParams.get('download') === '1'
               /** @type {Record<string, string>} */
               const headers = {
@@ -2266,8 +3261,23 @@ export async function apply(ctx, config = {}) {
                 writeJson(res, 404, { ok: false, code: 'deck-not-found' })
                 return
               }
+              // The canvas asks for a folder after its own directory picker, so
+              // the user has already consented to this location by hand.
+              const directory = typeof body.dir === 'string' ? body.dir.trim() : ''
+              if (directory !== '') {
+                const refusal = directoryRefusal(directory)
+                if (refusal !== null) {
+                  writeJson(res, 400, { ok: false, code: 'bad-directory', message: refusal })
+                  return
+                }
+              }
               try {
-                const receipt = await exportDeck(entry, typeof body.path === 'string' ? body.path : undefined, entry.model.template?.path ?? null)
+                const receipt = await exportDeck(
+                  entry,
+                  typeof body.path === 'string' ? body.path : undefined,
+                  entry.model.template?.path ?? null,
+                  directory === '' ? undefined : directory,
+                )
                 writeJson(res, 200, {
                   ok: true,
                   value: { ...receipt, download: `${API_PREFIX}/download?deck=${encodeURIComponent(entry.model.id)}` },

@@ -6,7 +6,9 @@
  *      that draws the deck slide by slide over SSE, lets the user select /
  *      move / resize / retype elements, insert images, and send one structured
  *      note back to the session;
- *   2. a tool-call card for `pptx_studio_open` that opens that canvas.
+ *   2. a tool-call card for **every** `pptx_studio_*` tool — each one switches
+ *      the canvas to the deck that step writes (and focuses it) as soon as the
+ *      call appears, and reports the step's progress next to the result.
  *
  * Three invariants this file is built around:
  *   - **PowerPoint geometry.** One inch is 96 CSS px, so at 100% zoom a 30pt run
@@ -16,8 +18,10 @@
  *     mode `--dsw-alias-brand-primary` is near-black and in dark mode near-white,
  *     so a primary button must pair `button-primary-fill` with
  *     `label-primary-foreground` instead of a hard-coded white label.
- *   - **Nothing dead.** Every control either does its job or is disabled with a
- *     reason; edits apply locally first, then persist through `POST /edit`.
+ *   - **Never the previous deck.** A call that has not produced its deck yet
+ *     opens the tab "pending" and shows that call's progress; the host's
+ *     session feed (`/api/session`) names the deck a running call writes, so a
+ *     tab left on an older .pptx switches the moment the deck exists.
  * @module dsh-pptx-studio/client
  */
 window.__ModuleLoader__.load({
@@ -53,8 +57,10 @@ window.__ModuleLoader__.load({
     const SWATCHES = ['#0F172A', '#334155', '#64748B', '#2563EB', '#0EA5E9', '#10B981', '#F59E0B', '#EF4444', '#FFFFFF']
     /** Cap on undo snapshots (a deck is small; 40 is plenty). */
     const UNDO_LIMIT = 40
-    /** Workflow stages, in order. */
-    const STAGE_ORDER = ['research', 'preview', 'build']
+    /** How long a "pending" tab navigation stays meaningful (ms). */
+    const PENDING_GRACE_MS = 20_000
+    /** Workflow stages, in order. Template first: it defines what can be built. */
+    const STAGE_ORDER = ['template', 'research', 'preview', 'build']
     /** Slide transition kinds the canvas can preview (mirrors lib/model.js). */
     const TRANSITION_TYPES = ['none', 'fade', 'push', 'wipe', 'split', 'cover', 'pull', 'cut', 'zoom', 'dissolve', 'circle', 'random']
     /** Transitions whose direction matters. */
@@ -97,9 +103,18 @@ window.__ModuleLoader__.load({
       'status.saved': '已导出 {name}',
       'status.follow': '跟随最新',
       'actions.export': '导出 PPTX',
-      'actions.save': '保存 PPTX',
+      'actions.save': '保存',
+      'actions.saveHint': '保存到画布目录（Ctrl+S）',
       'actions.exporting': '导出中…',
       'actions.download': '下载',
+      'actions.downloadHint': '导出到任意位置（Ctrl+Shift+S）',
+      'actions.downloading': '导出中…',
+      'actions.savedAt': '已保存 {name}（{size}）',
+      'actions.exportedAt': '已导出到 {path}',
+      'actions.exportCancelled': '已取消，未导出',
+      'actions.handedOver': '已交给浏览器下载：{name}',
+      'actions.noChannel': '这个环境里没有可用的保存通道，导出失败',
+      'actions.staleHost': '宿主还没重载：文件其实写到了 {path}。重载插件后再试。',
       'actions.refresh': '重新加载',
       'actions.close': '关闭',
       'actions.send': '发给 DSH',
@@ -164,6 +179,31 @@ window.__ModuleLoader__.load({
       'card.slides': '{count} 页',
       'card.opening': '正在打开右侧画布，马上就能看到逐页绘制…',
       'card.live': '画布已跟进本次生成',
+      'card.following': '画布已切到这一步，进度会同步显示',
+      'card.switching': '正在把右侧画布切到这一步的 deck…',
+      'card.failed': '这一步失败了：{message}',
+      'card.noDeckYet': '这次调用还没有 deck（新画布要等 pptx_studio_open 返回）',
+      'task.running': '正在{label}…',
+      'task.done': '已完成{label}',
+      'task.failed': '{label}失败',
+      'task.deck': 'deck：{id}',
+      'task.elapsed': '{n}s',
+      'task.waitingTitle': '正在准备新的画布…',
+      'task.waitingHint': 'Agent 正在{label}；新 deck 一落地，画布就会自动切过去，不会停在上一份 pptx 上。',
+      'task.waitingStep': '等这一步把新 deck 建出来…',
+      'tool.open': '打开画布',
+      'tool.template': '拆解模板',
+      'tool.research': '分析与调研',
+      'tool.preview': '生成 HTML 效果稿',
+      'tool.deck': '更新演示文稿设置',
+      'tool.plan': '规划页面骨架',
+      'tool.slide': '绘制幻灯片',
+      'tool.addElement': '添加元素',
+      'tool.patch': '修改画布',
+      'tool.inspect': '检查画布',
+      'tool.verify': '一致性校验',
+      'tool.export': '导出 PPTX',
+      'tool.busy': '处理中',
       'deck.picker': '画布',
       'deck.delete': '删除这份画布',
       'deck.confirm': '再点一次删除',
@@ -205,9 +245,11 @@ window.__ModuleLoader__.load({
       'clipboard.cut': '已剪切 {n} 个元素',
       'clipboard.pasted': '已粘贴 {n} 个元素',
       'zoom.label': '{pct}%',
+      'stage.template': '模板',
       'stage.research': '调研分析',
       'stage.preview': 'HTML 效果',
       'stage.build': '幻灯片',
+      'stage.stepTemplate': '⓪ 模板',
       'stage.stepResearch': '① 调研',
       'stage.stepPreview': '② HTML',
       'stage.stepSlides': '③ 幻灯片',
@@ -239,6 +281,33 @@ window.__ModuleLoader__.load({
       'preview.sandboxHint': '沙箱预览：脚本与外链样式不会加载；图片用内联 data URL。',
       'preview.size': 'HTML {kb} KB',
       'preview.ask': '对 HTML 预览提意见',
+      'template.emptyTitle': '这个 deck 没有使用模板',
+      'template.emptyBody': '空白模式没有模板可分。用 pptx_studio_open 传 template 参数打开模板模式的 deck，Agent 分解后这里会列出每页版式、可填字段与配色。',
+      'template.decomposingTitle': '正在分解模板…',
+      'template.decomposingBody': 'Agent 正在调用 pptx_studio_template 把 .pptx 模板拆成可复用版式；完成后这里会列出每页角色、字段与配色。',
+      'template.unavailableTitle': '模板数据读取失败',
+      'template.unavailableBody': '画布拿不到分解结果（{error}）。让 Agent 重新调用 pptx_studio_template 分解一次。',
+      'template.reload': '刷新模板',
+      'template.engine': '引擎',
+      'template.pagesShort': '{n} 页',
+      'template.fieldsShort': '{n} 个字段',
+      'template.textHidden': '文字已隐去',
+      'template.noPages': '模板里没有可用的页',
+      'template.design': '模板设计',
+      'template.palette': '配色',
+      'template.fonts': '字体',
+      'template.textColors': '文字颜色',
+      'template.mapped': '本 deck 第 {n} 页',
+      'template.mappingEmpty': '本 deck 还没有页映射：让 Agent 在 pptx_studio_research 的 outline 里写 templateSlide + fields。',
+      'template.mappedFields': '已填字段',
+      'template.noFields': '这一页没有可填字段',
+      'template.fieldCap': '≤{n} 字',
+      'template.fromSlide': '来自模板第 {n} 页',
+      'template.role.cover': '封面',
+      'template.role.toc': '目录',
+      'template.role.section': '章节',
+      'template.role.content': '内容',
+      'template.role.ending': '结尾',
       'stage.send': '发给 DSH',
       'stage.sending': '发送中…',
       'stage.needText': '先写一句意见',
@@ -319,9 +388,18 @@ window.__ModuleLoader__.load({
       'status.saved': 'Exported {name}',
       'status.follow': 'Follow latest',
       'actions.export': 'Export PPTX',
-      'actions.save': 'Save PPTX',
+      'actions.save': 'Save',
+      'actions.saveHint': 'Save into the deck folder (Ctrl+S)',
       'actions.exporting': 'Exporting…',
       'actions.download': 'Download',
+      'actions.downloadHint': 'Export to any folder (Ctrl+Shift+S)',
+      'actions.downloading': 'Exporting…',
+      'actions.savedAt': 'Saved {name} ({size})',
+      'actions.exportedAt': 'Exported to {path}',
+      'actions.exportCancelled': 'Cancelled — nothing exported',
+      'actions.handedOver': 'Handed to the browser ({name})',
+      'actions.noChannel': 'No save channel is available in this environment',
+      'actions.staleHost': 'The Host has not reloaded yet: the file actually went to {path}. Reload the plugin and retry.',
       'actions.refresh': 'Reload',
       'actions.close': 'Close',
       'actions.send': 'Send to DSH',
@@ -386,6 +464,31 @@ window.__ModuleLoader__.load({
       'card.slides': '{count} slides',
       'card.opening': 'Opening the right-hand canvas — slides will draw in live…',
       'card.live': 'Canvas is following this build',
+      'card.following': 'The canvas switched to this step; progress shows live',
+      'card.switching': 'Switching the right-hand canvas to this step’s deck…',
+      'card.failed': 'This step failed: {message}',
+      'card.noDeckYet': 'No deck yet (a new canvas appears once pptx_studio_open returns)',
+      'task.running': '{label}…',
+      'task.done': '{label} done',
+      'task.failed': '{label} failed',
+      'task.deck': 'deck: {id}',
+      'task.elapsed': '{n}s',
+      'task.waitingTitle': 'Preparing the new canvas…',
+      'task.waitingHint': 'The agent is {label}; the canvas switches to the new deck as soon as it exists, instead of staying on the previous .pptx.',
+      'task.waitingStep': 'Waiting for this step to create the new deck…',
+      'tool.open': 'opening the canvas',
+      'tool.template': 'decomposing the template',
+      'tool.research': 'researching the brief',
+      'tool.preview': 'writing the HTML mockup',
+      'tool.deck': 'updating the deck settings',
+      'tool.plan': 'planning the slides',
+      'tool.slide': 'drawing slides',
+      'tool.addElement': 'adding elements',
+      'tool.patch': 'editing the canvas',
+      'tool.inspect': 'inspecting the canvas',
+      'tool.verify': 'verifying consistency',
+      'tool.export': 'exporting the .pptx',
+      'tool.busy': 'working',
       'deck.picker': 'Deck',
       'deck.delete': 'Delete this deck',
       'deck.confirm': 'Click again to delete',
@@ -427,9 +530,11 @@ window.__ModuleLoader__.load({
       'clipboard.cut': 'Cut {n} element(s)',
       'clipboard.pasted': 'Pasted {n} element(s)',
       'zoom.label': '{pct}%',
+      'stage.template': 'Template',
       'stage.research': 'Research',
       'stage.preview': 'HTML preview',
       'stage.build': 'Slides',
+      'stage.stepTemplate': '⓪ Template',
       'stage.stepResearch': '① Research',
       'stage.stepPreview': '② HTML',
       'stage.stepSlides': '③ Slides',
@@ -461,6 +566,33 @@ window.__ModuleLoader__.load({
       'preview.sandboxHint': 'Sandboxed preview: scripts and external styles do not load; inline data URL images only.',
       'preview.size': 'HTML {kb} KB',
       'preview.ask': 'Comment on the HTML preview',
+      'template.emptyTitle': 'This deck has no template',
+      'template.emptyBody': 'Blank-mode decks have no template to decompose. Open a template-mode deck with pptx_studio_open(template); after the agent decomposes it, every layout, field and the palette show up here.',
+      'template.decomposingTitle': 'Decomposing the template…',
+      'template.decomposingBody': 'The agent is calling pptx_studio_template to turn the .pptx into reusable layouts; page roles, fields and the palette will appear here when it is done.',
+      'template.unavailableTitle': 'Template data unavailable',
+      'template.unavailableBody': 'The canvas could not load the decomposition ({error}). Ask the agent to run pptx_studio_template again.',
+      'template.reload': 'Reload template',
+      'template.engine': 'Engine',
+      'template.pagesShort': '{n} pages',
+      'template.fieldsShort': '{n} fields',
+      'template.textHidden': 'text hidden',
+      'template.noPages': 'No usable template pages',
+      'template.design': 'Template design',
+      'template.palette': 'Palette',
+      'template.fonts': 'Fonts',
+      'template.textColors': 'Text colours',
+      'template.mapped': 'Deck page {n}',
+      'template.mappingEmpty': 'No page mapping yet: ask the agent to add templateSlide + fields to each pptx_studio_research outline item.',
+      'template.mappedFields': 'Filled fields',
+      'template.noFields': 'No fillable fields on this page',
+      'template.fieldCap': '≤{n} chars',
+      'template.fromSlide': 'From template page {n}',
+      'template.role.cover': 'Cover',
+      'template.role.toc': 'Contents',
+      'template.role.section': 'Section',
+      'template.role.content': 'Content',
+      'template.role.ending': 'Ending',
       'stage.send': 'Send to DSH',
       'stage.sending': 'Sending…',
       'stage.needText': 'Write a note first',
@@ -529,7 +661,10 @@ window.__ModuleLoader__.load({
      * document colours, because a .pptx is a white page in both themes.
      */
     const CSS = `
-.ps-root{
+/* Token aliases live on both surfaces: the canvas tab and the tool cards that
+   the conversation renders (a card is not inside .ps-root, so without this its
+   colours and borders would fall back to nothing). */
+.ps-root,.ps-scope{
   --ps-bg:var(--dsw-alias-bg-layer-1,#fff);
   --ps-bg-soft:var(--dsw-alias-bg-layer-2,#f5f6f8);
   --ps-border:var(--dsw-alias-border-l1,rgba(0,0,0,.08));
@@ -546,8 +681,10 @@ window.__ModuleLoader__.load({
   --ps-success:var(--dsw-alias-state-success-primary,#047857);
   --ps-idle:var(--dsw-alias-state-idle-primary,#94a3b8);
   --ps-font:var(--dsh-font-family-text-default,-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif);
+  color:var(--ps-fg);font:12px/1.45 var(--ps-font)}
+.ps-root{
   display:flex;flex-direction:column;height:100%;min-height:0;gap:8px;padding:8px 10px 10px;box-sizing:border-box;
-  color:var(--ps-fg);font:12px/1.45 var(--ps-font);outline:none}
+  outline:none}
 
 .ps-editor{display:flex;flex-direction:column;flex:1 1 auto;min-height:180px;border:1px solid var(--ps-border-strong);
   border-radius:10px;background:var(--ps-bg-soft);overflow:hidden;box-shadow:0 1px 2px rgba(15,23,42,.05)}
@@ -677,7 +814,11 @@ window.__ModuleLoader__.load({
 .ps-el[data-type="line"]{background:#e2e8f0}
 .ps-el[data-type="table"] table{width:100%;height:100%;border-collapse:collapse;table-layout:fixed}
 .ps-el[data-type="table"] td{border:1px solid #e2e8f0;padding:2px 4px;overflow:hidden;color:#0f172a}
-.ps-el[data-type="chart"],.ps-el[data-type="group"]{background:#f8fafc;border:1px dashed #cbd5e1;color:#64748b;
+.ps-el[data-type="group"]{background:#f8fafc;border:1px dashed #cbd5e1;color:#64748b;
+  display:flex;align-items:center;justify-content:center;font-size:11px;text-align:center}
+/* A chart keeps the slide's own background (theming happens in renderChart);
+   only a dashed frame hints at the chart area, like the export's noFill. */
+.ps-el[data-type="chart"]{border:1px dashed #cbd5e1;color:#64748b;
   display:flex;align-items:center;justify-content:center;font-size:11px;text-align:center}
 .ps-hit{position:absolute;inset:0;cursor:move}
 .ps-el[data-selected="true"]{outline:1.5px solid var(--ps-accent);outline-offset:0}
@@ -738,9 +879,23 @@ window.__ModuleLoader__.load({
 .ps-card .hd{display:flex;align-items:center;gap:8px;font-size:12px;font-weight:600}
 .ps-card .sub{font-size:11px;color:var(--ps-fg-muted)}
 .ps-card .badge{font-size:10px;border-radius:999px;padding:1px 7px;background:var(--ps-bg-soft);color:var(--ps-fg-muted)}
+/* Session task strip: which step is running and which deck it writes. */
+.ps-task{display:flex;align-items:center;gap:6px;min-height:24px;padding:2px 8px;border-radius:6px;
+  border:1px solid color-mix(in srgb,var(--ps-accent) 22%,transparent);
+  background:color-mix(in srgb,var(--ps-accent) 7%,transparent);color:var(--ps-fg);font-size:11px;
+  box-sizing:border-box;flex:0 0 auto}
+.ps-task[data-ps-task="failed"]{border-color:color-mix(in srgb,var(--ps-danger) 32%,transparent);
+  background:color-mix(in srgb,var(--ps-danger) 8%,transparent)}
+.ps-task-dot{width:6px;height:6px;border-radius:50%;background:var(--ps-accent);flex:0 0 auto;
+  animation:ps-pulse 1.1s ease-in-out infinite}
+.ps-task[data-ps-task="failed"] .ps-task-dot{background:var(--ps-danger);animation:none}
+.ps-task-text{font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.ps-task-msg{color:var(--ps-fg-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.ps-task-elapsed{color:var(--ps-fg-muted);font-variant-numeric:tabular-nums;flex:0 0 auto}
+.ps-tab-dot{display:inline-block;width:5px;height:5px;margin-left:5px;border-radius:50%;background:var(--ps-accent);
+  vertical-align:middle;animation:ps-pulse 1.1s ease-in-out infinite}
 .ps-err{color:var(--ps-danger);font-size:11px}
-.ps-ok{color:var(--ps-success);font-size:11px}
-.ps-drop{position:absolute;inset:6px;border:2px dashed var(--ps-accent);border-radius:8px;pointer-events:none;
+.ps-ok{color:var(--ps-success);font-size:11px}.ps-drop{position:absolute;inset:6px;border:2px dashed var(--ps-accent);border-radius:8px;pointer-events:none;
   background:color-mix(in srgb,var(--ps-accent) 8%,transparent);z-index:30;display:flex;align-items:center;justify-content:center;
   color:var(--ps-fg);font-size:12px;font-weight:500}
 @keyframes ps-slide-in{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
@@ -785,6 +940,34 @@ window.__ModuleLoader__.load({
 .ps-stage-note{margin-top:8px;display:flex;flex-direction:column;gap:6px}
 .ps-stage-note .ps-row{align-items:center}
 
+/* ── template walkthrough (⓪ before research) ──────────────────────────── */
+.ps-tpl{display:flex;flex-direction:column;gap:8px;min-width:0}
+.ps-tpl-summary{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.ps-tpl-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;min-width:0}
+.ps-tpl-page{display:flex;flex-direction:column;gap:5px;min-width:0;border:1px solid var(--ps-border);border-radius:8px;
+  padding:6px;background:var(--ps-bg-soft)}
+.ps-tpl-page.mapped{border-color:var(--ps-accent);background:var(--ps-bg);
+  box-shadow:0 0 0 1px color-mix(in srgb,var(--ps-accent) 32%,transparent)}
+.ps-tpl-thumb{position:relative;aspect-ratio:16/9;border-radius:5px;overflow:hidden;background:var(--ps-bg);
+  border:1px solid var(--ps-border)}
+.ps-tpl-thumb img{width:100%;height:100%;object-fit:cover;display:block}
+.ps-tpl-no{position:absolute;left:3px;top:3px;font-size:9px;line-height:1.4;border-radius:3px;padding:0 3px;
+  background:var(--ps-elevated);color:var(--ps-fg);opacity:.92}
+.ps-tpl-role{position:absolute;right:3px;bottom:3px;font-size:9px;line-height:1.4;border-radius:999px;padding:0 5px;
+  background:var(--ps-primary);color:var(--ps-on-accent)}
+.ps-tpl-fields{display:flex;flex-direction:column;gap:2px;min-width:0}
+.ps-tpl-field{display:flex;align-items:baseline;gap:5px;font-size:10px;min-width:0;overflow:hidden}
+.ps-tpl-field code{flex:0 0 auto;color:var(--ps-accent);font-size:10px}
+.ps-tpl-field .sample{flex:1 1 auto;min-width:0;color:var(--ps-fg-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ps-tpl-field .cap{flex:0 0 auto;color:var(--ps-fg-muted);opacity:.85}
+.ps-tpl-title{font-size:11px;color:var(--ps-fg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ps-tpl-meta{display:flex;align-items:center;gap:6px;flex-wrap:wrap;min-height:14px}
+.ps-tpl-mapped{font-size:10px;font-weight:600;color:var(--ps-accent);white-space:nowrap}
+.ps-tpl-chip{display:inline-flex;align-items:center;height:16px;padding:0 5px;border-radius:999px;font-size:9px;font-weight:600;
+  border:1px solid color-mix(in srgb,var(--ps-accent) 42%,transparent);color:var(--ps-accent);white-space:nowrap}
+.ps-thumb .ps-tpl-badge{position:absolute;left:50%;top:2px;transform:translateX(-50%);font-size:8px;line-height:1.4;
+  border-radius:3px;padding:0 3px;background:var(--ps-primary);color:var(--ps-on-accent);opacity:.9}
+
 /* ── slide settings / theme ─────────────────────────────────────────────── */
 .ps-settings{display:flex;flex-direction:column;gap:8px;border:1px solid var(--ps-border);border-radius:8px;padding:8px;background:var(--ps-bg)}
 .ps-settings .ps-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}
@@ -806,9 +989,6 @@ window.__ModuleLoader__.load({
 /* ── chart preview ──────────────────────────────────────────────────────── */
 .ps-chart{width:100%;height:100%;display:flex;flex-direction:column;gap:4px;padding:6px;box-sizing:border-box;overflow:hidden}
 .ps-chart .t{font-size:10px;color:#334155;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.ps-chart .plot{flex:1;display:flex;align-items:flex-end;gap:6px;min-height:0}
-.ps-chart .grp{flex:1;display:flex;align-items:flex-end;justify-content:center;gap:2px;height:100%}
-.ps-chart .bar{flex:1;max-width:18px;border-radius:2px 2px 0 0;min-height:1px}
 .ps-chart .cats{display:flex;gap:6px;font-size:8px;color:#64748b;flex:0 0 auto}
 .ps-chart .cats span{flex:1;text-align:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ps-chart svg{width:100%;height:100%;display:block}
@@ -948,6 +1128,250 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Last path segment of a file path (handles both separators).
+     * @param {unknown} path - file path.
+     * @returns {string} file name, or an empty string.
+     */
+    function fileNameOf(path) {
+      const parts = String(path ?? '').split(/[\\/]+/).filter(Boolean)
+      return parts.length > 0 ? parts[parts.length - 1] : ''
+    }
+
+    /**
+     * Human-sized byte count for receipts (`12345` → `12.1 KB`).
+     * @param {unknown} bytes - byte count.
+     * @returns {string} readable size.
+     */
+    function byteSize(bytes) {
+      const value = Number(bytes)
+      if (!Number.isFinite(value) || value < 0) return '—'
+      if (value < 1024) return `${Math.round(value)} B`
+      if (value < 1024 * 1024) return `${Math.round(value / 102.4) / 10} KB`
+      return `${Math.round(value / 104857.6) / 10} MB`
+    }
+
+    // ── session activity feed ────────────────────────────────────────────────
+
+    /** Short dictionary key of each `pptx_studio_*` tool. */
+    const TOOL_SHORT = {
+      pptx_studio_open: 'open',
+      pptx_studio_template: 'template',
+      pptx_studio_research: 'research',
+      pptx_studio_preview: 'preview',
+      pptx_studio_deck: 'deck',
+      pptx_studio_plan: 'plan',
+      pptx_studio_slide: 'slide',
+      pptx_studio_add_element: 'addElement',
+      pptx_studio_patch: 'patch',
+      pptx_studio_inspect: 'inspect',
+      pptx_studio_verify: 'verify',
+      pptx_studio_export: 'export',
+    }
+
+    /**
+     * Localized label of one tool (the fallback is the wire name).
+     * @param {(key: string, values?: Record<string, unknown>) => string} t - translator.
+     * @param {string} name - tool name.
+     * @returns {string} label.
+     */
+    function toolLabel(t, name) {
+      const short = TOOL_SHORT[String(name || '')]
+      return short ? t(`tool.${short}`) : (String(name || '') || t('tool.busy'))
+    }
+
+    /**
+     * Per-session activity feeds. The host publishes the `pptx_studio_*` call in
+     * flight (which deck it writes, which step it is); the canvas tab and the
+     * tool cards share one stream per session so a tab showing the previous deck
+     * can switch to the deck being drawn, and the cards can report progress.
+     *
+     * @type {Map<string, {task: Record<string, any>|null, listeners: Set<(task: Record<string, any>) => void>, refs: number, started: boolean, source: any, poll: any}>}
+     */
+    const taskFeeds = new Map()
+
+    /**
+     * The feed record of one session (created on first use).
+     * @param {string} sessionId - session id.
+     * @returns {any} feed record.
+     */
+    function taskFeedOf(sessionId) {
+      let feed = taskFeeds.get(sessionId)
+      if (!feed) {
+        feed = { task: null, listeners: new Set(), refs: 0, started: false, source: null, poll: null }
+        taskFeeds.set(sessionId, feed)
+      }
+      return feed
+    }
+
+    /**
+     * Accept one published task (the host's `seq` only grows).
+     * @param {string} sessionId - session id.
+     * @param {any} task - task payload.
+     * @returns {void}
+     */
+    function acceptTask(sessionId, task) {
+      if (!task || typeof task !== 'object') return
+      const feed = taskFeedOf(sessionId)
+      const previous = feed.task
+      if (previous && Number(task.seq || 0) <= Number(previous.seq || 0)) return
+      feed.task = task
+      for (const listener of [...feed.listeners]) {
+        try {
+          listener(task)
+        } catch {
+          /* one broken subscriber must not stop the others */
+        }
+      }
+    }
+
+    /**
+     * Start (or restart) the stream of one session: a snapshot fetch plus SSE,
+     * with a slow poll when the page has no EventSource.
+     * @param {string} sessionId - session id.
+     * @returns {void}
+     */
+    function startTaskFeed(sessionId) {
+      const feed = taskFeedOf(sessionId)
+      if (feed.started) return
+      feed.started = true
+      const refresh = () => {
+        request(`session?sessionId=${encodeURIComponent(sessionId)}`, { timeoutMs: 8000 })
+          .then((data) => {
+            if (data && data.task) acceptTask(sessionId, data.task)
+          })
+          .catch(() => { /* host may be reloading; SSE retries on its own */ })
+      }
+      refresh()
+      if (typeof EventSource === 'function') {
+        try {
+          const source = new EventSource(api(`session/events?sessionId=${encodeURIComponent(sessionId)}`))
+          source.onmessage = (message) => {
+            let event
+            try {
+              event = JSON.parse(message.data)
+            } catch {
+              return
+            }
+            if (event && event.type === 'task') acceptTask(sessionId, event.task)
+          }
+          feed.source = source
+        } catch {
+          feed.source = null
+        }
+      }
+      if (!feed.source) {
+        feed.poll = setInterval(refresh, 2500)
+        if (feed.poll && typeof feed.poll.unref === 'function') feed.poll.unref()
+      }
+    }
+
+    /**
+     * Stop one session's stream once nothing listens any more.
+     * @param {string} sessionId - session id.
+     * @returns {void}
+     */
+    function stopTaskFeed(sessionId) {
+      const feed = taskFeedOf(sessionId)
+      if (feed.source) {
+        try {
+          feed.source.close()
+        } catch {
+          /* already closed */
+        }
+        feed.source = null
+      }
+      if (feed.poll) {
+        clearInterval(feed.poll)
+        feed.poll = null
+      }
+      feed.started = false
+    }
+
+    /**
+     * Subscribe to one session's task feed.
+     * @param {string} sessionId - session id.
+     * @param {(task: any) => void} listener - sink.
+     * @returns {() => void} unsubscribe.
+     */
+    function subscribeTask(sessionId, listener) {
+      const feed = taskFeedOf(sessionId)
+      feed.listeners.add(listener)
+      feed.refs += 1
+      startTaskFeed(sessionId)
+      return () => {
+        feed.listeners.delete(listener)
+        feed.refs = Math.max(0, feed.refs - 1)
+        if (feed.refs === 0) stopTaskFeed(sessionId)
+      }
+    }
+
+    /**
+     * Read the running (or last) pptx step of one session.
+     * @param {string|undefined} sessionId - session id.
+     * @returns {any} task or null.
+     */
+    function useSessionTask(sessionId) {
+      const [task, setTask] = useState(null)
+      useEffect(() => {
+        const id = typeof sessionId === 'string' ? sessionId : ''
+        if (id === '') {
+          setTask(null)
+          return undefined
+        }
+        setTask(taskFeedOf(id).task)
+        return subscribeTask(id, setTask)
+      }, [sessionId])
+      return task
+    }
+
+    /**
+     * Elapsed seconds of a running task, refreshed every second.
+     * @param {any} task - task payload.
+     * @returns {number} seconds (0 when the task is not running).
+     */
+    function useElapsed(task) {
+      const running = Boolean(task && task.state === 'running')
+      const [now, setNow] = useState(() => Date.now())
+      useEffect(() => {
+        if (!running) return undefined
+        setNow(Date.now())
+        const timer = setInterval(() => setNow(Date.now()), 1000)
+        return () => clearInterval(timer)
+      }, [running, task && task.seq])
+      if (!running) return 0
+      const started = typeof task.startedAt === 'string' ? Date.parse(task.startedAt) : NaN
+      if (!Number.isFinite(started)) return 0
+      return Math.max(0, Math.round((now - started) / 1000))
+    }
+
+
+    /**
+     * Translation key of one workflow-step chip (template is step ⓪, before
+     * research). Kept in one place so the pending shell and the live canvas
+     * cannot drift apart.
+     * @param {string} key - stage key from `STAGE_ORDER`.
+     * @returns {string} dictionary key.
+     */
+    function stageStepKey(key) {
+      if (key === 'template') return 'stage.stepTemplate'
+      if (key === 'research') return 'stage.stepResearch'
+      if (key === 'preview') return 'stage.stepPreview'
+      return 'stage.stepSlides'
+    }
+
+    /**
+     * Translation key of one workflow-stage title.
+     * @param {string} key - stage key from `STAGE_ORDER`.
+     * @returns {string} dictionary key.
+     */
+    function stageTitleKey(key) {
+      if (key === 'template') return 'stage.template'
+      if (key === 'research') return 'stage.research'
+      if (key === 'preview') return 'stage.preview'
+      return 'stage.build'
+    }
+
+    /**
      * Read an array-valued translation entry safely (a bound `t` returns the
      * raw key when the dictionary has no such entry).
      * @param {(key: string, values?: any) => any} t - translator.
@@ -1029,15 +1453,37 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Rough brightness test for a CSS colour, mirroring pptx_build.py's luma:
+     * decides whether a chart drawn on this background needs light or dark
+     * ink. Anything unparseable counts as light.
+     * @param {unknown} value - candidate colour.
+     * @returns {boolean} true when the colour reads as dark.
+     */
+    function isDarkBg(value) {
+      const raw = String(value || '').trim().replace(/^#/, '')
+      if (!/^([0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/.test(raw)) return false
+      const hex = raw.length <= 4 ? [...raw].map((d) => d + d).join('') : raw
+      const r = parseInt(hex.slice(0, 2), 16)
+      const g = parseInt(hex.slice(2, 4), 16)
+      const b = parseInt(hex.slice(4, 6), 16)
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b < 110
+    }
+
+    /**
      * Workflow stage of a deck, tolerant of decks written before the pipeline.
      * @param {any} deck - deck model.
-     * @returns {'research'|'preview'|'build'} stage.
+     * @returns {'template'|'research'|'preview'|'build'} stage.
      */
     function stageOf(deck) {
       const pipeline = deck && deck.pipeline
       if (pipeline && pipeline.preview) return 'build'
       if (pipeline && pipeline.research) return 'preview'
       if (pipeline && pipeline.builtAt) return 'build'
+      // Template mode is its own first step: nothing can be decomposed before
+      // the template says which layouts and fields exist. The host exposes the
+      // stage directly (`pipeline.stage`); the `template.required` fallback keeps
+      // decks written before that field from skipping it.
+      if (pipeline && (pipeline.stage === 'template' || (pipeline.template && pipeline.template.required === true && !pipeline.template.decomposedAt))) return 'template'
       return ((deck && deck.slides) || []).length > 0 ? 'build' : 'research'
     }
 
@@ -1437,8 +1883,45 @@ window.__ModuleLoader__.load({
     // ── element rendering ────────────────────────────────────────────────────
 
     /**
+     * Nice round value-axis ticks covering [0, max(data)] (and the negatives,
+     * if any), the way PowerPoint picks automatic axis bounds.
+     * @param {number[]} numbers - every data point of the chart.
+     * @returns {{bottom: number, top: number, ticks: number[]}} axis scale.
+     */
+    function axisScale(numbers) {
+      const flat = numbers.length > 0 ? numbers : [0]
+      const lo = Math.min(0, ...flat)
+      const hi = Math.max(1, ...flat)
+      const span = hi - lo || 1
+      const raw = span / 4
+      const mag = Math.pow(10, Math.floor(Math.log10(raw)))
+      const norm = raw / mag
+      const step = (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 2.5 ? 2.5 : norm <= 5 ? 5 : 10) * mag
+      const bottom = Math.floor(lo / step) * step
+      const top = Math.ceil(hi / step) * step
+      const ticks = []
+      for (let value = bottom; value <= top + step / 2; value += step) {
+        ticks.push(Math.round(value * 1000) / 1000)
+      }
+      return { bottom, top: bottom + (ticks.length - 1) * step, ticks }
+    }
+
+    /**
+     * Format an axis tick the short way (integers stay integers).
+     * @param {number} value - tick value.
+     * @returns {string} label text.
+     */
+    function formatTick(value) {
+      return String(Math.round(value * 100) / 100)
+    }
+
+    /**
      * Draw a native chart element as a lightweight SVG/HTML approximation.
-     * The exported .pptx carries a real chart part; this is the canvas view.
+     * The exported .pptx carries a real chart part; this canvas view mirrors
+     * that part's structure (pptx_build.py#add_chart / #theme_chart): the same
+     * palette, an automatic value axis with gridlines, a bottom legend for
+     * multi-series charts, the single-series auto title, and value labels on
+     * pie/doughnut — so what the agent draws is what the file will contain.
      * @param {Record<string, any>} el - chart element.
      * @param {Record<string, any>} ctx - render context.
      * @returns {import('react').ReactNode} node.
@@ -1448,26 +1931,79 @@ window.__ModuleLoader__.load({
       const kind = String(chart.kind || 'column')
       const categories = Array.isArray(chart.categories) ? chart.categories : []
       const series = Array.isArray(chart.series) ? chart.series : []
-      const colors = series.map((item, index) => cssColor(item.color, CHART_PALETTE[index % CHART_PALETTE.length]))
-      const fontPx = Math.max(6, 9 * ctx.zoom)
-      const title = chart.title
-        ? h('div', { className: 't', style: { fontSize: `${Math.max(7, 10 * ctx.zoom)}px` } }, String(chart.title))
+      // The canvas approximation follows the deck theme exactly like the
+      // exported chart part (pptx_build.py#theme_chart): accent-led palette,
+      // transparent canvas, light ink on a dark slide.
+      const theme = (ctx.theme && ctx.theme.colors) || DEFAULT_THEME.colors
+      const dark = isDarkBg(cssColor(ctx.background, theme.background || '#FFFFFF'))
+      const palette = [cssColor(theme.accent, CHART_PALETTE[0]), ...CHART_PALETTE.slice(1)]
+      const colors = series.map((item, index) => cssColor(item.color, palette[index % palette.length]))
+      const textColor = cssColor(dark ? theme.surface : theme.ink, '#0f172a')
+      const axisColor = cssColor(theme.muted, '#64748b')
+      const trackColor = dark ? cssColor(theme.surface, '#f1f5f9') : '#eef2f7'
+      const trackOpacity = dark ? 0.14 : 1
+      // pptx_build sets chart.font.size = style.size || 11pt.
+      const fontPx = Math.max(6, (Number(el.style && el.style.size) || 11) * pxPerPt(ctx.zoom))
+      // Only an explicit chart title shows: the design sheet owns page titles,
+      // and the export hides the auto title (autoTitleDeleted=1).
+      const titleText = String(chart.title || '')
+      const title = titleText
+        ? h('div', { className: 't', style: { fontSize: `${Math.max(7, fontPx * 1.1)}px`, color: textColor } }, titleText)
+        : null
+      // Chart styling the design sheet can ask for (see model.js#normalizeChart);
+      // pptx_build.py#add_chart honours the very same fields.
+      const bareAxis = String(chart.axis || 'auto') === 'none'
+      const gradient = Array.isArray(chart.gradient) && chart.gradient.length >= 2
+        ? `linear-gradient(180deg, ${cssColor(chart.gradient[0], colors[0])}, ${cssColor(chart.gradient[1], colors[0])})`
+        : null
+      const valueLabels = chart.dataLabels === true
+      const cornerCss = typeof chart.corner === 'number' && chart.corner > 0
+        ? `${Math.round(chart.corner * 100)}% ${Math.round(chart.corner * 100)}% 0 0`
+        : '0'
+      const barBackground = gradient || colors[0]
+      // Multi-series charts carry a bottom legend in the export.
+      const legend = series.length > 1
+        ? h('div', {
+          style: {
+            display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center', alignItems: 'center',
+            flex: '0 0 auto', fontSize: `${fontPx}px`, color: textColor,
+          },
+        },
+          series.map((item, index) => h('span', { key: `l${index}`, style: { display: 'inline-flex', alignItems: 'center', gap: 3, minWidth: 0 } },
+            h('span', { style: { width: 7, height: 7, borderRadius: 2, background: colors[index], flex: '0 0 auto' } }),
+            h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, String(item.name || `系列 ${index + 1}`)))))
         : null
       if (series.length === 0 || categories.length === 0) {
         return h('div', { className: 'ps-chart' }, title, h('div', { className: 'ps-hint' }, ctx.approx))
       }
       const values = series.map((item) => (Array.isArray(item.values) ? item.values : []))
-      const max = Math.max(1, ...values.flat().map((value) => Math.abs(Number(value) || 0)))
-      const total = values[0].reduce((sum, value) => sum + Math.max(0, Number(value) || 0), 0) || 1
+      const scale = axisScale(values.flat().map((value) => Number(value) || 0))
+      const pct = (value) => ((Number(value) || 0) - scale.bottom) / (scale.top - scale.bottom) * 100
+      const yAxisW = Math.round(fontPx * 2.6) + 6
+      const yAxisLabels = h('div', {
+        style: {
+          width: yAxisW, flex: '0 0 auto', display: 'flex', flexDirection: 'column',
+          justifyContent: 'space-between', alignItems: 'flex-end', paddingRight: 4,
+          fontSize: `${fontPx}px`, color: textColor, textAlign: 'right',
+        },
+      }, [...scale.ticks].reverse().map((tick, index) => h('span', { key: `y${index}`, style: { lineHeight: 1 } }, formatTick(tick))))
+      const gridlines = scale.ticks.map((tick, index) => h('div', {
+        key: `g${index}`,
+        style: { position: 'absolute', left: 0, right: 0, bottom: `${pct(tick)}%`, height: 1, background: axisColor, opacity: 0.35 },
+      }))
+      const zeroLine = h('div', { style: { position: 'absolute', left: 0, right: 0, bottom: `${pct(0)}%`, height: 1, background: axisColor } })
 
       if (kind === 'pie' || kind === 'doughnut') {
+        // Export turns data labels on for pie/doughnut and shows values only,
+        // so the canvas lists the values (category names ride in the tooltip).
+        const total = values[0].reduce((sum, value) => sum + Math.max(0, Number(value) || 0), 0) || 1
         let cursor = 0
         const stops = values[0].map((value, index) => {
           const start = cursor
           cursor += (Math.max(0, Number(value) || 0) / total) * 100
           return `${colors[index % colors.length]} ${start}% ${cursor}%`
         })
-        const hole = kind === 'doughnut' ? 'radial-gradient(circle at 50% 50%, ' + cssColor(el.fill, '#FFFFFF') + ' 0 42%, transparent 43%)' : null
+        const hole = kind === 'doughnut' ? 'radial-gradient(circle at 50% 50%, ' + cssColor(el.fill, 'transparent') + ' 0 42%, transparent 43%)' : null
         return h('div', { className: 'ps-chart' },
           title,
           h('div', { style: { flex: '1 1 auto', minHeight: 0, display: 'flex', alignItems: 'center', gap: 8 } },
@@ -1478,63 +2014,101 @@ window.__ModuleLoader__.load({
                   background: hole ? `${hole}, conic-gradient(${stops.join(',')})` : `conic-gradient(${stops.join(',')})`,
                 },
               })),
-            h('div', { style: { display: 'flex', flexDirection: 'column', gap: 2, fontSize: `${fontPx}px`, color: '#334155', minWidth: 0 } },
-              categories.map((category, index) => h('div', { key: `l${index}`, style: { display: 'flex', alignItems: 'center', gap: 4 } },
+            h('div', { style: { display: 'flex', flexDirection: 'column', gap: 2, fontSize: `${fontPx}px`, color: textColor, minWidth: 0 } },
+              categories.map((category, index) => h('div', { key: `l${index}`, title: String(category), style: { display: 'flex', alignItems: 'center', gap: 4 } },
                 h('span', { style: { width: 7, height: 7, borderRadius: 2, background: colors[index % colors.length], display: 'inline-block', flex: '0 0 auto' } }),
-                h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, String(category)))))))
+                h('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, formatTick(Number(values[0][index]) || 0)))))),
+          legend)
       }
 
       if (kind === 'line' || kind === 'area') {
-        const width = 100
-        const height = 100
-        const step = categories.length > 1 ? width / (categories.length - 1) : width
+        const step = categories.length > 1 ? 100 / (categories.length - 1) : 0
         const paths = values.map((line) => line.map((value, index) => {
-          const x = categories.length > 1 ? index * step : width / 2
-          const y = height - (Math.abs(Number(value) || 0) / max) * (height - 12) - 6
+          const x = categories.length > 1 ? index * step : 50
+          const y = 100 - pct(value)
           return `${Math.round(x * 100) / 100},${Math.round(y * 100) / 100}`
         }))
+        const markerPx = Math.max(3, 2.4 * ctx.zoom)
         return h('div', { className: 'ps-chart' },
           title,
-          h('div', { style: { flex: '1 1 auto', minHeight: 0 } },
-            h('svg', { viewBox: '0 0 100 100', preserveAspectRatio: 'none', style: { width: '100%', height: '100%' } },
-              h('line', { x1: 0, y1: 99, x2: 100, y2: 99, stroke: '#cbd5e1', strokeWidth: 0.5 }),
-              paths.map((points, index) => h(kind === 'area' ? 'polygon' : 'polyline', {
-                key: `s${index}`,
-                points: kind === 'area' ? `0,100 ${points.join(' ')} 100,100` : points.join(' '),
-                fill: kind === 'area' ? colors[index % colors.length] : 'none',
-                fillOpacity: kind === 'area' ? 0.18 : 0,
-                stroke: colors[index % colors.length],
-                strokeWidth: 1.6,
-              })))),
-          h('div', { className: 'cats', style: { fontSize: `${fontPx}px` } },
-            categories.map((category, index) => h('span', { key: `c${index}` }, String(category)))))
+          h('div', { style: { flex: '1 1 auto', minHeight: 0, display: 'flex' } },
+            yAxisLabels,
+            h('div', { style: { flex: '1 1 auto', minWidth: 0, position: 'relative' } },
+              h('svg', { viewBox: '0 0 100 100', preserveAspectRatio: 'none', style: { width: '100%', height: '100%' } },
+                scale.ticks.map((tick, index) => h('line', { key: `g${index}`, x1: 0, x2: 100, y1: 100 - pct(tick), y2: 100 - pct(tick), stroke: axisColor, strokeWidth: 0.4, opacity: 0.35 })),
+                h('line', { x1: 0, x2: 100, y1: 100 - pct(0), y2: 100 - pct(0), stroke: axisColor, strokeWidth: 0.6 }),
+                paths.map((points, index) => h(kind === 'area' ? 'polygon' : 'polyline', {
+                  key: `s${index}`,
+                  points: kind === 'area' ? `0,100 ${points.join(' ')} 100,100` : points.join(' '),
+                  fill: kind === 'area' ? colors[index % colors.length] : 'none',
+                  fillOpacity: kind === 'area' ? 0.18 : 0,
+                  stroke: colors[index % colors.length],
+                  strokeWidth: 1.6,
+                }))),
+              // markers sit outside the stretched svg so they stay round
+              ...(kind === 'line' ? values.flatMap((line, seriesIndex) => line.map((value, index) => h('div', {
+                key: `m${seriesIndex}-${index}`,
+                title: `${String(series[seriesIndex].name || '')} · ${String(categories[index] || '')}`,
+                style: {
+                  position: 'absolute', left: `${categories.length > 1 ? (index / (categories.length - 1)) * 100 : 50}%`,
+                  top: `${100 - pct(value)}%`, width: markerPx, height: markerPx, borderRadius: '50%',
+                  background: colors[seriesIndex % colors.length], transform: 'translate(-50%, -50%)',
+                },
+              }))) : []))),
+          h('div', { className: 'cats', style: { marginLeft: yAxisW, fontSize: `${fontPx}px`, color: textColor } },
+            categories.map((category, index) => h('span', { key: `c${index}` }, String(category)))),
+          legend)
       }
 
       if (kind === 'bar') {
+        const labelW = Math.round(fontPx * 4) + 8
+        const rowH = series.length > 1 ? 3 : 8
         return h('div', { className: 'ps-chart' },
           title,
-          h('div', { style: { flex: '1 1 auto', display: 'flex', flexDirection: 'column', justifyContent: 'space-around', minHeight: 0 } },
-            categories.map((category, index) => h('div', { key: `b${index}`, style: { display: 'flex', alignItems: 'center', gap: 4 } },
-              h('span', { style: { width: 42, flex: '0 0 auto', fontSize: `${fontPx}px`, color: '#64748b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, String(category)),
-              h('span', { style: { flex: '1 1 auto', height: 8, background: '#eef2f7', borderRadius: 2, overflow: 'hidden' } },
-                h('span', { style: { display: 'block', height: '100%', width: `${(Math.abs(Number(values[0][index]) || 0) / max) * 100}%`, background: colors[0], borderRadius: 2 } }))))))
+          h('div', { style: { flex: '1 1 auto', minHeight: 0, display: 'flex', flexDirection: 'column' } },
+            h('div', { style: { flex: '1 1 auto', minHeight: 0, position: 'relative', display: 'flex', flexDirection: 'column', justifyContent: 'space-around' } },
+              scale.ticks.map((tick, index) => h('div', {
+                key: `g${index}`,
+                style: { position: 'absolute', top: 0, bottom: 0, left: `${pct(tick)}%`, width: 1, background: axisColor, opacity: 0.35 },
+              })),
+              categories.map((category, index) => h('div', { key: `b${index}`, style: { display: 'flex', alignItems: 'center', gap: 4 } },
+                h('span', { style: { width: labelW, flex: '0 0 auto', fontSize: `${fontPx}px`, color: textColor, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, String(category)),
+                h('span', { style: { flex: '1 1 auto', minWidth: 0, display: 'flex', flexDirection: 'column', gap: 1 } },
+                  series.map((item, seriesIndex) => h('span', { key: `s${seriesIndex}`, title: String(item.name || ''), style: { display: 'block', height: rowH, background: trackColor, opacity: trackOpacity, borderRadius: 1, overflow: 'hidden' } },
+                    h('span', { style: { display: 'block', height: '100%', width: `${Math.max(0, pct(Number(values[seriesIndex][index]) || 0))}%`, background: gradient || colors[seriesIndex % colors.length], borderRadius: 1 } }))))))),
+            h('div', { style: { marginLeft: labelW + 4, display: 'flex', justifyContent: 'space-between', fontSize: `${fontPx}px`, color: textColor, flex: '0 0 auto' } },
+              scale.ticks.map((tick, index) => h('span', { key: `t${index}` }, formatTick(tick))))),
+          legend)
       }
 
-      return h('div', { className: 'ps-chart' },
-        title,
-        h('div', { className: 'plot' },
-          categories.map((category, index) => h('div', { key: `g${index}`, className: 'grp' },
+      // column: value axis on the left, gridlines, zero axis, category axis —
+      // or, with axis:"none", bare bars with value labels like the design sheet.
+      const plotArea = h('div', { style: { flex: '1 1 auto', minWidth: 0, position: 'relative' } },
+        bareAxis ? null : gridlines,
+        h('div', { style: { position: 'absolute', inset: 0, display: 'flex', alignItems: 'flex-end', gap: 6 } },
+          categories.map((category, index) => h('div', { key: `g${index}`, style: { flex: 1, minWidth: 0, display: 'flex', alignItems: 'flex-end', justifyContent: 'center', gap: 2, height: '100%' } },
             series.map((item, seriesIndex) => h('div', {
               key: `b${seriesIndex}`,
-              className: 'bar',
               style: {
-                height: `${Math.max(1, (Math.abs(Number(values[seriesIndex][index]) || 0) / max) * 100)}%`,
-                background: colors[seriesIndex],
-                opacity: 0.9,
+                width: '38%', maxWidth: 22, minHeight: 1,
+                height: `${Math.max(0, pct(Number(values[seriesIndex][index]) || 0))}%`,
+                display: 'flex', flexDirection: 'column', justifyContent: 'flex-end',
               },
-            }))))),
-        h('div', { className: 'cats', style: { fontSize: `${fontPx}px` } },
-          categories.map((category, index) => h('span', { key: `c${index}` }, String(category)))))
+            },
+              valueLabels
+                ? h('span', { style: { fontSize: `${fontPx}px`, fontWeight: 600, color: textColor, textAlign: 'center', lineHeight: 1.2, marginBottom: 2 } }, formatTick(Number(values[seriesIndex][index]) || 0))
+                : null,
+              h('span', { style: { flex: '1 1 auto', minHeight: 1, background: gradient || colors[seriesIndex % colors.length], borderRadius: cornerCss } }))))),
+        bareAxis ? null : zeroLine,
+        bareAxis ? null : h('div', { style: { position: 'absolute', left: 0, top: 0, bottom: 0, width: 1, background: axisColor } })))
+      return h('div', { className: 'ps-chart' },
+        title,
+        h('div', { style: { flex: '1 1 auto', minHeight: 0, display: 'flex' } },
+          bareAxis ? null : yAxisLabels,
+          plotArea),
+        h('div', { className: 'cats', style: { marginLeft: bareAxis ? 0 : yAxisW, fontSize: `${fontPx}px`, color: textColor } },
+          categories.map((category, index) => h('span', { key: `c${index}` }, String(category)))),
+        legend)
     }
 
     /**
@@ -1743,6 +2317,14 @@ window.__ModuleLoader__.load({
       const [decks, setDecks] = useState([])
       const [confirmDelete, setConfirmDelete] = useState(false)
       const paramDeckId = typeof params.deckId === 'string' ? params.deckId : ''
+      // A tool card opens the canvas before a *new* deck exists and marks the
+      // navigation "pending": the shell has to show that step's progress
+      // instead of falling back to the deck of the previous build.
+      const paramPending = typeof params.pending === 'string' && params.pending !== ''
+      const paramNonce = params.nonce === undefined ? '' : String(params.nonce)
+      // Every `openTab` records its own navigation; `at` makes a repeat open of
+      // the same deck a new intent instead of an ignored duplicate.
+      const paramSignature = `${paramDeckId}|${params.at === undefined ? '' : String(params.at)}`
       const [deckId, setDeckId] = useState(paramDeckId)
       const [deck, setDeck] = useState(null)
       const [phase, setPhase] = useState({ phase: 'idle', message: '', slideIndex: 0, total: 0 })
@@ -1780,6 +2362,12 @@ window.__ModuleLoader__.load({
       const [titleEditing, setTitleEditing] = useState(false)
       const [view, setView] = useState('auto')
       const [template, setTemplate] = useState(null)
+      // Decomposed template catalogue (pages/roles/fields/palette), served by
+      // `GET /api/template`. `template` above is the PowerPoint layout list that
+      // comes with `/api/state`; this one is the template-first workflow spec.
+      const [templateInfo, setTemplateInfo] = useState(null)
+      const [templateError, setTemplateError] = useState('')
+      const [templateNonce, setTemplateNonce] = useState(0)
       const [settingsOpen, setSettingsOpen] = useState(false)
       const [themeOpen, setThemeOpen] = useState(false)
       const [fx, setFx] = useState(null)
@@ -1789,6 +2377,11 @@ window.__ModuleLoader__.load({
       const [previewNonce, setPreviewNonce] = useState(0)
       const [previewBoxWidth, setPreviewBoxWidth] = useState(0)
       const [shortcutsOpen, setShortcutsOpen] = useState(false)
+      // The running pptx step of this session: it names the deck being written
+      // and the step, so the canvas switches to it and says what is happening.
+      const task = useSessionTask(sessionId)
+      const taskRunning = Boolean(task && task.state === 'running')
+      const taskSeconds = useElapsed(task)
 
       const stageRef = useRef(null)
       const previewRef = useRef(null)
@@ -1803,9 +2396,17 @@ window.__ModuleLoader__.load({
       const deleteTimer = useRef(null)
       const dragRef = useRef(null)
       const clipboardRef = useRef(null)
+      /** True while the tab waits for the deck of a call that has not created it yet. */
+      const awaitingDeckRef = useRef(paramPending)
+      /** First task snapshot of this mount (a finished one must not yank the tab). */
+      const firstTaskRef = useRef(true)
+      /** Navigation signature already applied by the param effect. */
+      const lastParamRef = useRef(paramSignature)
       const undoRef = useRef([])
       const redoRef = useRef([])
       const deckRef = useRef(null)
+      /** Deck id of the current render; in-flight loads compare against it. */
+      const deckIdRef = useRef(deckId)
       const followRef = useRef(true)
       const selectionRef = useRef(null)
       const pendingRef = useRef(0)
@@ -1824,11 +2425,22 @@ window.__ModuleLoader__.load({
       const zoom = zoomMode === 'fit' ? fit : Number(zoomMode) || 1
       const rev = (deck && deck.meta && deck.meta.updatedAt) || ''
       const stage = stageOf(deck)
-      const autoView = stage === 'research' ? 'research' : stage === 'preview' ? 'preview' : (slides.length === 0 ? 'preview' : 'slides')
+      const autoView = stage === 'template' ? 'template' : stage === 'research' ? 'research' : stage === 'preview' ? 'preview' : (slides.length === 0 ? 'preview' : 'slides')
       const activeView = view === 'auto' ? autoView : view
       const theme = themeOf(deck)
       const research = (deck && deck.pipeline && deck.pipeline.research) || null
       const htmlPreview = (deck && deck.pipeline && deck.pipeline.preview) || null
+      // Template-first workflow: `pipeline.template` exists only for decks opened
+      // with a .pptx template. `decomposedAt` is what the host flips when
+      // `pptx_studio_template` finished, so it drives the ⓪ step's done state.
+      const pipelineTemplate = (deck && deck.pipeline && deck.pipeline.template) || null
+      const templateDecomposed = Boolean(pipelineTemplate && pipelineTemplate.decomposedAt)
+      // Re-decomposing an already-decomposed template changes `decomposedAt` but
+      // not the boolean, so the timestamp is what the fetch effect keys on.
+      const templateStamp = pipelineTemplate && pipelineTemplate.decomposedAt ? String(pipelineTemplate.decomposedAt) : ''
+      const templatePages = templateInfo && Array.isArray(templateInfo.pages)
+        ? templateInfo.pages.length
+        : (pipelineTemplate && Number(pipelineTemplate.pages) > 0 ? Number(pipelineTemplate.pages) : 0)
       const previewUrl = deckId
         ? api(`preview?deck=${encodeURIComponent(deckId)}&v=${encodeURIComponent((htmlPreview && htmlPreview.updatedAt) || '')}&r=${previewNonce}`)
         : ''
@@ -1843,6 +2455,7 @@ window.__ModuleLoader__.load({
       const previewDisplayHeight = Math.max(220, Math.round(previewSize.height * previewScale))
 
       deckRef.current = deck
+      deckIdRef.current = deckId
       followRef.current = follow
       selectionRef.current = selection
       slideRef.current = current
@@ -2008,7 +2621,10 @@ window.__ModuleLoader__.load({
           const mine = all.filter((item) => !item.sessionId || item.sessionId === sessionId)
           const list = mine.length > 0 ? mine : all
           setDecks(list)
-          if (deckId === '' && list.length > 0) setDeckId(list[0].id)
+          // A tab opened for a *new* call must not fall back to the newest deck
+          // on disk: that is the previous build, and showing it is exactly the
+          // "it opened the old pptx" complaint. Wait for the new deck instead.
+          if (deckId === '' && list.length > 0 && !awaitingDeckRef.current) setDeckId(list[0].id)
           return list
         } catch (err) {
           setError(err instanceof Error ? err.message : String(err))
@@ -2028,6 +2644,10 @@ window.__ModuleLoader__.load({
           const params = new URLSearchParams({ deck: id })
           if (sessionId) params.set('sessionId', sessionId)
           const data = await request(`state?${params.toString()}`, {})
+          // The tab may have switched (or been cleared for a new call) while
+          // this response was in flight: an older deck must not land on top of
+          // the newer one — that is how "the old pptx reappeared" happens.
+          if (deckIdRef.current !== id) return
           setDeck(data.deck || null)
           setTemplate(data.template || null)
           // A reload is a deliberate jump: drop any reveal still in flight so a
@@ -2094,13 +2714,14 @@ window.__ModuleLoader__.load({
         return () => { if (deleteTimer.current) clearTimeout(deleteTimer.current) }
       }, [confirmDelete])
 
-      // First load: decks, then the selected deck.
+      // First load: decks, then the selected deck. A pending call has no deck
+      // yet on purpose — the shell must not load the previous build.
       useEffect(() => {
         let alive = true
         ;(async () => {
           const list = await loadDecks()
           if (!alive) return
-          const target = deckId || list[0]?.id
+          const target = deckId || (awaitingDeckRef.current ? '' : list[0]?.id) || ''
           if (target) await loadState(target)
           else setLoading(false)
         })()
@@ -2110,11 +2731,44 @@ window.__ModuleLoader__.load({
 
       useEffect(() => { if (deckId) void loadState(deckId) }, [deckId, loadState])
 
+      // Template catalogue for the ⓪ panel. Only fetched once the host reports
+      // the template as decomposed (`pipeline.template.decomposedAt`); before
+      // that the route answers 404, and the panel shows the "in progress" copy
+      // instead of an error. `templateNonce` re-runs it on demand.
+      useEffect(() => {
+        if (!deckId || !templateDecomposed) {
+          setTemplateInfo(null)
+          setTemplateError('')
+          return undefined
+        }
+        let alive = true
+        const params = new URLSearchParams({ deck: deckId })
+        if (sessionId) params.set('sessionId', sessionId)
+        request(`template?${params.toString()}`, {})
+          .then((data) => {
+            if (!alive) return
+            setTemplateInfo(data && data.ok !== false ? data : null)
+            setTemplateError('')
+          })
+          .catch((err) => {
+            if (!alive) return
+            setTemplateInfo(null)
+            setTemplateError(err instanceof Error ? err.message : String(err))
+          })
+        return () => { alive = false }
+      }, [deckId, sessionId, templateDecomposed, templateStamp, templateNonce])
+
       // The tool card navigates the already-open tab to the deck it just opened
       // (`openTab` rewrites the tab's navigation params). Without this the tab
-      // would keep showing the previous deck while the new one is drawn.
+      // would keep showing the previous deck while the new one is drawn. Only a
+      // *new* navigation may move the canvas: re-applying an unchanged param on
+      // every render would drag it back after a running call took the screen.
       useEffect(() => {
-        if (!paramDeckId || paramDeckId === deckId) return
+        if (!paramDeckId) return
+        awaitingDeckRef.current = false
+        if (paramSignature === lastParamRef.current) return
+        lastParamRef.current = paramSignature
+        if (paramDeckId === deckId) return
         setDeckId(paramDeckId)
         setSlideIndex(0)
         setFollow(true)
@@ -2122,7 +2776,78 @@ window.__ModuleLoader__.load({
         setMultiSelection(null)
         setEditing(null)
         setView('auto')
-      }, [paramDeckId, deckId])
+      }, [paramDeckId, paramSignature, deckId])
+
+      // A card that opened the canvas for a call whose deck does not exist yet
+      // marks the navigation "pending". Do not fall back to the deck of the
+      // previous build: show the preparing shell for *this* call instead. The
+      // nonce changes on every open, so a second new call re-arms it. A stale
+      // flag (a page reload, or a call that never produced a deck) must not
+      // leave the canvas empty forever, so it expires with its nonce.
+      useEffect(() => {
+        if (!paramPending) return
+        const armedAt = Number(paramNonce) || 0
+        const stale = armedAt > 0 && Date.now() - armedAt > PENDING_GRACE_MS
+        if (stale) {
+          awaitingDeckRef.current = false
+          void loadDecks()
+          return
+        }
+        awaitingDeckRef.current = true
+        setDeck(null)
+        setDeckId('')
+        setSlideIndex(0)
+        setFollow(true)
+        setSelection(null)
+        setMultiSelection(null)
+        setEditing(null)
+        setView('auto')
+        setLoading(false)
+        setError('')
+      }, [paramPending, paramNonce, loadDecks])
+
+      // The host publishes the deck each running call writes. A tab that is
+      // showing the previous pptx switches here — that is the whole point of the
+      // canvas — even when the tool card that opened it is already gone.
+      useEffect(() => {
+        if (!task) return
+        const running = Boolean(task.state === 'running')
+        const target = typeof task.deckId === 'string' ? task.deckId : ''
+        const first = firstTaskRef.current
+        firstTaskRef.current = false
+        // Opening the tab later must not drag the user off the deck they are
+        // reading just because the last call (already finished) wrote another
+        // one; only a call that is still running takes the screen.
+        if (first && !running && target !== '') return
+        // A brand-new canvas is being created and has no deck yet: whatever is
+        // on screen is the previous build, so show this call's progress instead
+        // of letting the old pptx pass for the new one.
+        if (running && task.tool === 'pptx_studio_open' && target === '') {
+          if (deckId === '' && deck === null) return
+          awaitingDeckRef.current = true
+          setDeck(null)
+          setDeckId('')
+          setSlideIndex(0)
+          setFollow(true)
+          setSelection(null)
+          setMultiSelection(null)
+          setEditing(null)
+          setView('auto')
+          return
+        }
+        if (target === '') return
+        awaitingDeckRef.current = false
+        if (target === deckId) return
+        setDeckId(target)
+        setSlideIndex(0)
+        setFollow(true)
+        setSelection(null)
+        setMultiSelection(null)
+        setEditing(null)
+        setView('auto')
+        // The new deck may be too fresh for the picker's snapshot.
+        void loadDecks()
+      }, [task && task.deckId, task && task.seq, task && task.state, task && task.tool, deckId, deck, loadDecks])
 
       // While no deck is on screen (the canvas was opened before the agent's
       // pptx_studio_open landed), look for one for a few seconds instead of
@@ -2972,6 +3697,57 @@ window.__ModuleLoader__.load({
       }, [commit])
 
       /**
+       * Hand one Host route to the browser's own download channel.
+       *
+       * `window.open` cannot do this job: the Desktop shell answers every popup
+       * with `deny` and only forwards http(s) to an external browser, which then
+       * lacks the Host's signed cookie. So the page fetches the bytes itself and
+       * lets a blob URL carry the file name.
+       * @param {string} url - same-origin route to fetch.
+       * @param {string} name - file name the browser should save as.
+       * @returns {Promise<boolean>} whether the download was handed over.
+       */
+      const saveRouteAsFile = useCallback(async (url, name) => {
+        if (!url) return false
+        try {
+          const response = await fetch(url, { credentials: 'same-origin' })
+          if (!response.ok) {
+            let detail = `HTTP ${response.status}`
+            try {
+              const data = JSON.parse(await response.text())
+              detail = data?.message || data?.code || detail
+            } catch { /* keep the status line */ }
+            throw new Error(detail)
+          }
+          const blob = await response.blob()
+          const doc = (rootRef.current && rootRef.current.ownerDocument) || (typeof document !== 'undefined' ? document : null)
+          const view = (doc && doc.defaultView) || (typeof window !== 'undefined' ? window : null)
+          if (!doc || !view || typeof doc.createElement !== 'function' || !view.URL || typeof view.URL.createObjectURL !== 'function') {
+            throw new Error(t('actions.noChannel'))
+          }
+          const href = view.URL.createObjectURL(blob)
+          const anchor = doc.createElement('a')
+          anchor.href = href
+          anchor.download = name
+          anchor.rel = 'noopener'
+          if (anchor.style) anchor.style.display = 'none'
+          const body = doc.body
+          if (body && typeof body.appendChild === 'function') body.appendChild(anchor)
+          anchor.click()
+          try {
+            if (anchor.parentNode && typeof anchor.remove === 'function') anchor.remove()
+            else if (body && typeof body.removeChild === 'function') body.removeChild(anchor)
+          } catch { /* the click already happened */ }
+          if (typeof view.setTimeout === 'function') view.setTimeout(() => view.URL.revokeObjectURL(href), 30000)
+          setNotice(fmt(t('actions.handedOver'), { name }))
+          return true
+        } catch (err) {
+          setError(err instanceof Error ? err.message : String(err))
+          return false
+        }
+      }, [rootRef, t])
+
+      /**
        * Open one URL in a new window/tab through the document that owns this
        * canvas (the harness may not expose `window.open`).
        * @param {string} url - absolute URL.
@@ -2994,8 +3770,14 @@ window.__ModuleLoader__.load({
       /** Open the HTML preview in a new window. */
       const openPreview = useCallback(() => openUrl(previewUrl), [openUrl, previewUrl])
 
-      /** Download the HTML preview file. */
-      const downloadPreview = useCallback(() => openUrl(previewUrl ? `${previewUrl}&download=1` : ''), [openUrl, previewUrl])
+      /**
+       * Save the HTML mock-up through the browser's download channel.
+       * @returns {void}
+       */
+      const downloadPreview = useCallback(() => {
+        if (!previewUrl) return
+        void saveRouteAsFile(`${previewUrl}&download=1`, `${String(deck?.title ?? 'preview')}.html`)
+      }, [deck, previewUrl, saveRouteAsFile])
 
       /**
        * Compose a stage-level feedback message (research or HTML preview).
@@ -3336,42 +4118,77 @@ window.__ModuleLoader__.load({
       // ── export / download / close ──────────────────────────────────────────
 
       /**
-       * Export the deck and remember the receipt.
-       * @returns {Promise<void>} resolved when exported.
+       * Export the deck into its own store folder and remember the receipt.
+       * @returns {Promise<Record<string, any>|null>} the receipt, or null when it failed.
        */
       const exportDeck = useCallback(async () => {
-        if (!deckId || busy) return false
+        if (!deckId || busy) return null
         setBusy('export')
         setError('')
         try {
           const data = await request('export', { method: 'POST', body: { deckId }, timeoutMs: 190000 })
-          if (data?.value) setSaved(data.value)
-          return true
+          const value = data?.value ?? null
+          if (value) setSaved(value)
+          return value
         } catch (err) {
           setError(err instanceof Error ? err.message : String(err))
-          return false
+          return null
         } finally {
           setBusy('')
         }
       }, [busy, deckId])
 
       /**
-       * Open the exported file in a new browser/OS context (download route).
-       * @returns {void}
+       * Export to a folder the user picks with the Host's own directory picker.
+       *
+       * This is the "download" the toolbar promises: the file leaves the plugin
+       * store and lands wherever the user pointed at. Builds without that Client
+       * service fall back to the browser's download channel so the file still
+       * reaches the disk.
+       * @returns {Promise<void>} resolved when the attempt finished.
        */
-      const downloadDeck = useCallback(() => {
-        if (!deckId) return
-        const url = api(`download?deck=${encodeURIComponent(deckId)}`)
+      const downloadDeck = useCallback(async () => {
+        if (!deckId || busy) return
+        const uiWorkspace = hostCtx?.get?.('uiWorkspace') ?? null
+        const pick = uiWorkspace && typeof uiWorkspace.pickDirectory === 'function'
+          ? uiWorkspace.pickDirectory.bind(uiWorkspace)
+          : null
+        if (!pick) {
+          const name = fileNameOf(saved?.path) || `${String(deck?.title ?? 'deck')}.pptx`
+          await saveRouteAsFile(api(`download?deck=${encodeURIComponent(deckId)}`), name)
+          return
+        }
+        setBusy('download')
+        setError('')
         try {
-          if (rootRef.current && typeof rootRef.current.ownerDocument?.defaultView?.open === 'function') {
-            rootRef.current.ownerDocument.defaultView.open(url, '_blank')
+          const directory = await pick()
+          if (typeof directory !== 'string' || directory.trim() === '') {
+            setNotice(t('actions.exportCancelled'))
             return
           }
-        } catch { /* fall through */ }
-        try {
-          if (typeof window !== 'undefined' && typeof window.open === 'function') window.open(url, '_blank')
-        } catch { /* ignore */ }
-      }, [deckId])
+          const data = await request('export', {
+            method: 'POST',
+            body: { deckId, dir: directory.trim() },
+            timeoutMs: 190000,
+          })
+          const value = data?.value ?? null
+          if (value) setSaved(value)
+          const produced = String(value?.path ?? '')
+          const picked = directory.trim().replace(/[\\/]+$/, '')
+          const fold = (text) => text.replace(/\\/g, '/').toLowerCase()
+          if (produced !== '' && !fold(produced).startsWith(`${fold(picked)}/`)) {
+            // A Host that predates the `dir` parameter writes into the deck
+            // folder instead; say so rather than claim the file went where it did not.
+            setError(fmt(t('actions.staleHost'), { path: produced }))
+            return
+          }
+          setNotice(fmt(t('actions.exportedAt'), { path: produced || picked }))
+        } catch (err) {
+          setError(err instanceof Error ? err.message : String(err))
+        } finally {
+          setBusy('')
+        }
+      }, [busy, deck, deckId, saveRouteAsFile, saved, t])
 
       /**
        * Close this canvas tab through whichever handle the sidebar exposes.
@@ -3397,28 +4214,29 @@ window.__ModuleLoader__.load({
       }, [props, sessionId, tab])
 
       /**
-       * Save the deck through the same export route as the toolbar button.
+       * Save the deck in place: the .pptx beside its own deck.json.
        * @returns {Promise<void>} resolved when the export attempt finished.
        */
       const saveDeck = useCallback(async () => {
         if (!deckId || busy === 'export' || slides.length === 0) return
         setNotice(t('shortcut.saving'))
-        const ok = await exportDeck()
-        if (ok) setNotice(t('shortcut.saved'))
+        const value = await exportDeck()
+        if (value) {
+          setNotice(fmt(t('actions.savedAt'), {
+            name: fileNameOf(value.path) || 'deck.pptx',
+            size: byteSize(value.bytes),
+          }))
+        }
       }, [busy, deckId, exportDeck, slides.length, t])
 
       /**
-       * Save and immediately open the download route (Ctrl+Shift+S).
-       * @returns {Promise<void>} resolved when the export attempt finished.
+       * Save a copy wherever the user points (Ctrl+Shift+S).
+       * @returns {void}
        */
       const saveDeckAs = useCallback(() => {
-        if (!deckId || slides.length === 0) return
-        // Open the download route synchronously so browsers keep the user
-        // gesture (an awaited export would let popup blockers eat the window).
-        // The route exports on demand when deck.pptx is missing.
-        downloadDeck()
-        setNotice(t('shortcut.saved'))
-      }, [deckId, downloadDeck, slides.length, t])
+        if (!deckId || slides.length === 0 || busy) return
+        void downloadDeck()
+      }, [busy, deckId, downloadDeck, slides.length])
 
       /**
        * One keyboard entry point for the canvas. Save works even inside an
@@ -3558,8 +4376,10 @@ window.__ModuleLoader__.load({
 
       const statusText = (() => {
         if (error) return error
-        const stageLabel = stage === 'research' ? t('stage.research') : stage === 'preview' ? t('stage.preview') : t('stage.build')
+        const stageLabel = t(stageTitleKey(stage))
         if (draw) return `${stageLabel} · ${fmt(t('status.elements'), { index: draw.slideIndex, done: Math.min(draw.done, draw.count), count: draw.count })}`
+        // A running call is the most useful status there is: say which step.
+        if (taskRunning) return `${stageLabel} · ${fmt(t('task.running'), { label: toolLabel(t, task.tool) })}`
         if (phase.phase === 'drawing') {
           return phase.begin
             ? `${stageLabel} · ${fmt(t('status.preparing'), { index: phase.slideIndex || safeIndex + 1 })}`
@@ -3572,6 +4392,11 @@ window.__ModuleLoader__.load({
         if (phase.phase === 'saved') return `${stageLabel} · ${fmt(t('status.saved'), { name: String(phase.message || '').split(/[\\/]/).pop() || '' })}`
         if (saved?.path) return fmt(t('saved.hint'), { path: saved.path })
         if (notice) return notice
+        if (activeView === 'template') {
+          if (!pipelineTemplate) return `${stageLabel} · ${t('template.emptyTitle')}`
+          if (!templateDecomposed) return `${stageLabel} · ${t('template.decomposingTitle')}`
+          return `${stageLabel} · ${fmt(t('template.pagesShort'), { n: templatePages })}`
+        }
         if (activeView === 'research' && !research) return `${stageLabel} · ${t('stage.nextResearch')}`
         if (activeView === 'preview' && !htmlPreview) return `${stageLabel} · ${t('stage.nextPreview')}`
         if (activeView === 'research' && research) return `${stageLabel} · ${t('stage.nextPreview')}`
@@ -3590,15 +4415,42 @@ window.__ModuleLoader__.load({
 
       // ── empty / loading states ─────────────────────────────────────────────
 
+      // A call opened this tab but its deck does not exist yet: say what the
+      // agent is doing instead of showing the previous build's deck.
+      const pendingCall = (Boolean(paramPending) || (taskRunning && task.tool === 'pptx_studio_open')) && !(task && task.state === 'failed')
+      const taskBanner = task && (task.state === 'running' || task.state === 'failed')
+        ? h('div', {
+            className: 'ps-task',
+            'data-ps-task': task.state,
+            'data-ps-tool': task.tool || '',
+            'data-ps-deck': task.deckId || '',
+            title: task.message || '',
+          },
+            h('span', { className: 'ps-task-dot', 'aria-hidden': 'true' }),
+            h('span', { className: 'ps-task-text' }, fmt(t(task.state === 'running' ? 'task.running' : 'task.failed'), { label: toolLabel(t, task.tool) })),
+            task.state === 'failed' && task.message ? h('span', { className: 'ps-task-msg' }, task.message) : null,
+            h('span', { style: { flex: 1 } }),
+            task.deckId ? h('span', { className: 'ps-meta' }, fmt(t('task.deck'), { id: task.deckId })) : null,
+            task.state === 'running' && taskSeconds > 0 ? h('span', { className: 'ps-task-elapsed' }, fmt(t('task.elapsed'), { n: taskSeconds })) : null,
+          )
+        : null
+
       // No deck yet (the agent has not called pptx_studio_open, or it is still
       // on its way): keep the very same editor/controls shell on screen with a
       // paper-shaped skeleton. The area the user will edit is reserved from the
       // first frame, so the deck does not "appear out of nowhere" and shove the
       // layout around when the first event lands.
       if (!deck) {
-        const waiting = loading ? t('state.loading') : t('empty.shellTitle')
-        const waitingHint = loading ? t('status.skeleton') : t('empty.shellBody')
-        return h('div', { className: 'ps-root', 'data-ps-root': loading ? 'loading' : 'waiting', ref: rootRef },
+        const waiting = pendingCall ? t('task.waitingTitle') : loading ? t('state.loading') : t('empty.shellTitle')
+        const waitingHint = pendingCall
+          ? fmt(t('task.waitingHint'), { label: task ? toolLabel(t, task.tool) : t('tool.busy') })
+          : loading ? t('status.skeleton') : t('empty.shellBody')
+        return h('div', {
+          className: 'ps-root',
+          'data-ps-root': pendingCall ? 'pending' : loading ? 'loading' : 'waiting',
+          'data-ps-pending': String(pendingCall),
+          ref: rootRef,
+        },
           h('div', { className: 'ps-bar' },
             h('span', { className: 'ps-dot' + (live ? ' live' : '') }),
             h('span', { className: 'ps-title' }, t('tab.title')),
@@ -3613,6 +4465,7 @@ window.__ModuleLoader__.load({
             }, '↻'),
             tab ? h('button', { className: 'ps-btn ghost', type: 'button', 'data-ps-btn': 'close-empty', title: t('actions.close'), onClick: closeTab }, '✕') : null,
           ),
+          taskBanner,
           h('div', { className: 'ps-steps', 'data-ps-steps': '1', 'data-pending': '1' },
             STAGE_ORDER.map((key, index) => h('span', {
               key,
@@ -3622,8 +4475,8 @@ window.__ModuleLoader__.load({
               'data-done': 'false',
               'aria-disabled': 'true',
             },
-              h('span', { className: 'n' }, String(index + 1)),
-              h('span', null, index === 0 ? t('stage.stepResearch') : index === 1 ? t('stage.stepPreview') : t('stage.stepSlides'))))),
+              h('span', { className: 'n' }, String(index)),
+              h('span', null, t(stageStepKey(key)))))),
           h('div', { className: 'ps-editor', 'data-ps-editor': '1', 'data-waiting': '1' },
             h('div', { className: 'ps-editor-head' },
               h('span', { className: 'ps-zone-label' }, t('zone.editor')),
@@ -3679,12 +4532,20 @@ window.__ModuleLoader__.load({
           slideW,
           slideH,
           rev,
+          theme,
           approx: t('approx'),
           background: thumbBackground(slide),
           thumbW: thumbWidth,
           designZoom: THUMB_DESIGN_ZOOM,
         }),
         h('span', { className: 'n' }, String(index + 1)),
+        Number.isInteger(slide.templateSlide)
+          ? h('span', {
+              className: 'ps-tpl-badge',
+              'data-ps-template-badge': String(slide.templateSlide),
+              title: fmt(t('template.fromSlide'), { n: slide.templateSlide }),
+            }, `T${slide.templateSlide}`)
+          : null,
         slide.hidden ? h('span', { className: 'h', title: t('slide.hidden') }, '⊘') : null,
         slide.transition && slide.transition.type && slide.transition.type !== 'none'
           ? h('span', { className: 'fx', title: slide.transition.type }, '✦')
@@ -3908,6 +4769,7 @@ window.__ModuleLoader__.load({
         ? (typeof TextEncoder === 'function' ? new TextEncoder().encode(htmlPreview.html).length : htmlPreview.html.length)
         : 0
       const stepSub = {
+        template: pipelineTemplate ? (templateDecomposed ? fmt(t('template.pagesShort'), { n: templatePages }) : t('stage.current')) : '',
         research: research && Array.isArray(research.outline) && research.outline.length > 0 ? `${research.outline.length} 页大纲` : '',
         preview: htmlPreview ? fmt(t('preview.size'), { kb: Math.max(1, Math.round(previewBytes / 1024)) }) : '',
         build: `${slides.length} 页`,
@@ -3915,7 +4777,10 @@ window.__ModuleLoader__.load({
       const legacyBuild = stage === 'build' && !research && !htmlPreview && slides.length > 0
       const steps = h('div', { className: 'ps-steps', 'data-ps-steps': '1' },
         STAGE_ORDER.map((key, index) => {
-          const done = legacyBuild || (key === 'research' ? Boolean(research) : key === 'preview' ? Boolean(htmlPreview) : slides.length > 0)
+          // ⓪ template: decomposed = done, still required = in progress.
+          const done = key === 'template'
+            ? templateDecomposed
+            : legacyBuild || (key === 'research' ? Boolean(research) : key === 'preview' ? Boolean(htmlPreview) : slides.length > 0)
           const active = key === 'build' ? activeView === 'slides' : activeView === key
           return h('button', {
             key,
@@ -3924,11 +4789,11 @@ window.__ModuleLoader__.load({
             'data-ps-step': key,
             'data-active': String(active),
             'data-done': String(done),
-            title: key === 'research' ? t('stage.research') : key === 'preview' ? t('stage.preview') : t('stage.build'),
+            title: t(stageTitleKey(key)),
             onClick: () => { setView(key === 'build' ? 'slides' : key); setSelection(null); setMultiSelection(null); setEditing(null) },
           },
-            h('span', { className: 'n' }, String(index + 1)),
-            h('span', null, index === 0 ? t('stage.stepResearch') : index === 1 ? t('stage.stepPreview') : t('stage.stepSlides')),
+            h('span', { className: 'n' }, String(index)),
+            h('span', null, t(stageStepKey(key))),
             stepSub[key] ? h('span', { className: 'sub' }, stepSub[key]) : null)
         }))
 
@@ -4065,6 +4930,138 @@ window.__ModuleLoader__.load({
         previewBody,
         stageNoteBox(t('preview.ask')))
 
+      // ── template panel (⓪ before research) ────────────────────────────────
+
+      /**
+       * Template walkthrough: page plates with their role and fillable fields,
+       * the template palette, and which pages this deck actually mapped. The
+       * data comes from `GET /api/template`, never from guesswork.
+       */
+      const templatePanel = (() => {
+        const info = templateInfo
+        const pages = info && Array.isArray(info.pages) ? info.pages : []
+        const mapping = info && Array.isArray(info.mapping) ? info.mapping : []
+        const summary = (info && info.summary) || {}
+        const design = (info && info.design) || {}
+        const palette = Array.isArray(design.palette) ? design.palette : []
+        const fonts = design.fonts || {}
+        const fontUsage = Array.isArray(design.fontUsage) ? design.fontUsage : []
+        const roleLabel = (role) => {
+          const key = `template.role.${role}`
+          const text = t(key)
+          return text === key ? String(role || '') : text
+        }
+        const mappedPage = (pageIndex) => mapping.find((item) => Number(item && item.templateSlide) === Number(pageIndex)) || null
+        const summaryBits = [
+          summary.engine ? `${t('template.engine')} ${summary.engine}` : '',
+          templatePages > 0 ? fmt(t('template.pagesShort'), { n: templatePages }) : '',
+          Number(summary.fields) > 0 ? fmt(t('template.fieldsShort'), { n: summary.fields }) : '',
+          info && info.size && Number(info.size.w) > 0 ? `${info.size.w} × ${info.size.h} in` : '',
+          summary.textHidden ? t('template.textHidden') : '',
+        ].filter(Boolean)
+        const designBlock = palette.length > 0 || fonts.title || fonts.body || fontUsage.length > 0
+          ? h('div', { className: 'ps-brief' },
+              h('div', { className: 'card' },
+                h('h5', null, t('template.design')),
+                palette.length > 0
+                  ? h('div', { className: 'ps-palette', 'data-ps-template-palette': '1' },
+                      palette.map((color, index) => h('span', {
+                        key: `${color.hex}:${index}`,
+                        title: `${color.hex} · ${Math.round((Number(color.share) || 0) * 100)}%`,
+                        'data-ps-palette-hex': String(color.hex),
+                        style: { background: cssColor(color.hex, 'transparent') },
+                      })))
+                  : null,
+                fonts.title || fonts.body
+                  ? h('div', { className: 'ps-hint', style: { marginTop: 4 } },
+                      `${t('template.fonts')}：${[fonts.title, fonts.body].filter(Boolean).join(' / ')}`)
+                  : null,
+                fontUsage.length > 0
+                  ? h('div', { className: 'ps-hint' }, fontUsage.slice(0, 4).map((item) => `${item.name}×${item.count}`).join(' · '))
+                  : null))
+          : null
+        let body
+        if (!pipelineTemplate) {
+          body = h('div', { className: 'ps-empty' },
+            h('h4', null, t('template.emptyTitle')),
+            h('p', null, t('template.emptyBody')))
+        } else if (!templateDecomposed) {
+          body = h('div', { className: 'ps-empty' },
+            h('h4', null, t('template.decomposingTitle')),
+            h('p', null, t('template.decomposingBody')),
+            pipelineTemplate.path ? h('div', { className: 'ps-hint', 'data-ps-template-path': '1' }, pipelineTemplate.path) : null)
+        } else if (!info) {
+          body = h('div', { className: 'ps-empty' },
+            h('h4', null, t('template.unavailableTitle')),
+            h('p', null, templateError ? fmt(t('template.unavailableBody'), { error: templateError }) : t('template.unavailableBody')))
+        } else {
+          body = h('div', { className: 'ps-tpl' },
+            summaryBits.length > 0
+              ? h('div', { className: 'ps-tpl-summary', 'data-ps-template-summary': '1' }, summaryBits.map((bit, index) => h('span', { key: `${index}:${bit}`, className: 'ps-hint' }, bit)))
+              : null,
+            designBlock,
+            pages.length > 0
+              ? h('div', { className: 'ps-tpl-grid', 'data-ps-template-grid': '1' }, pages.map((page) => {
+                  const pageIndex = Number(page.page)
+                  const mapped = mappedPage(pageIndex)
+                  const filled = mapped && mapped.fields && typeof mapped.fields === 'object' ? Object.keys(mapped.fields) : []
+                  return h('div', {
+                    key: `tpl${pageIndex}`,
+                    className: 'ps-tpl-page' + (mapped ? ' mapped' : ''),
+                    'data-ps-template-page': String(pageIndex),
+                    'data-ps-template-role': String(page.role || ''),
+                    'data-ps-template-mapped': String(Boolean(mapped)),
+                  },
+                    h('div', { className: 'ps-tpl-thumb' },
+                      h('img', {
+                        src: assetUrl(deckId, `template/thumbs/s${pageIndex}.jpg`, rev),
+                        alt: `${t('stage.template')} T${pageIndex}`,
+                      }),
+                      h('span', { className: 'ps-tpl-no' }, `T${pageIndex}`),
+                      h('span', { className: 'ps-tpl-role' }, roleLabel(page.role))),
+                    h('div', { className: 'ps-tpl-meta' },
+                      mapped
+                        ? h('span', { className: 'ps-tpl-mapped', 'data-ps-template-deck-page': String(mapping.indexOf(mapped) + 1) }, fmt(t('template.mapped'), { n: mapping.indexOf(mapped) + 1 }))
+                        : null,
+                      page.family ? h('span', { className: 'ps-hint' }, `family ${page.family}`) : null),
+                    Array.isArray(page.fields) && page.fields.length > 0
+                      ? h('div', { className: 'ps-tpl-fields', 'data-ps-template-fields': String(page.fields.length) },
+                          page.fields.map((field) => h('div', { key: `${pageIndex}:${field.id}`, className: 'ps-tpl-field', 'data-ps-template-field': String(field.id) },
+                            h('code', null, field.id),
+                            field.sample ? h('span', { className: 'sample', title: String(field.sample) }, String(field.sample).slice(0, 18)) : null,
+                            Number(field.maxCjk) > 0
+                              ? h('span', { className: 'cap', 'data-ps-field-cap': String(field.maxCjk) }, fmt(t('template.fieldCap'), { n: field.maxCjk }))
+                              : null)))
+                      : h('div', { className: 'ps-hint' }, t('template.noFields')),
+                    filled.length > 0
+                      ? h('div', { className: 'ps-hint', 'data-ps-template-fill': String(mapping.indexOf(mapped)) }, `${t('template.mappedFields')}：${filled.join('、')}`)
+                      : null,
+                    mapped && mapped.title ? h('div', { className: 'ps-tpl-title', title: mapped.title }, mapped.title) : null,
+                    page.guidance ? h('div', { className: 'ps-hint' }, page.guidance) : null)
+                }))
+              : h('div', { className: 'ps-hint' }, t('template.noPages')),
+            pages.length > 0 && mapping.length === 0
+              ? h('div', { className: 'ps-hint', 'data-ps-template-mapping': 'empty' }, t('template.mappingEmpty'))
+              : null)
+        }
+        return h('div', { className: 'ps-panel', 'data-ps-panel': 'template' },
+          h('div', { className: 'ps-panel-head' },
+            h('h4', null, t('stage.template')),
+            h('span', {
+              className: 'ps-badge' + (templateDecomposed ? ' ok' : ''),
+              'data-ps-template-status': templateDecomposed ? 'done' : (pipelineTemplate ? 'current' : 'pending'),
+            }, templateDecomposed ? t('stage.done') : pipelineTemplate ? t('stage.current') : t('stage.pending')),
+            h('span', { style: { flex: 1 } }),
+            templateDecomposed
+              ? h('button', { className: 'ps-btn ghost', type: 'button', 'data-ps-btn': 'template-reload', onClick: () => setTemplateNonce((n) => n + 1) }, t('template.reload'))
+              : null,
+            templateDecomposed && !research
+              ? h('button', { className: 'ps-btn', type: 'button', 'data-ps-btn': 'goto-research', onClick: () => setView('research') }, t('stage.stepResearch'))
+              : null),
+          body)
+      })()
+
+
       const currentTransition = (current && current.transition) || null
       const transitionType = currentTransition && currentTransition.type ? currentTransition.type : 'none'
       const directed = DIRECTED_TRANSITIONS.has(transitionType)
@@ -4151,6 +5148,17 @@ window.__ModuleLoader__.load({
                   onChange: (event) => toggleHidden(event.target.checked),
                 }),
                 t('slide.hidden'))),
+            Number.isInteger(current.templateSlide)
+              ? h('div', { className: 'ps-row', 'data-ps-slide-template': String(current.templateSlide) },
+                  h('span', { className: 'ps-meta' }, fmt(t('template.fromSlide'), { n: current.templateSlide })),
+                  h('span', { style: { flex: 1 } }),
+                  h('button', {
+                    className: 'ps-btn ghost',
+                    type: 'button',
+                    'data-ps-btn': 'goto-template',
+                    onClick: () => setView('template'),
+                  }, t('stage.template')))
+              : null,
             template && Array.isArray(template.layouts) && template.layouts.length > 0
               ? h('div', { className: 'ps-field' },
                   h('label', null, t('slide.layout')),
@@ -4274,6 +5282,8 @@ window.__ModuleLoader__.load({
                   slideW,
                   slideH,
                   rev,
+                  theme,
+                  background: bgColor,
                   approx: t('approx'),
                   interactive: true,
                   selected: Boolean(selection && selection.kind === 'element' && selection.elementId === el.id),
@@ -4411,23 +5421,39 @@ window.__ModuleLoader__.load({
             className: 'ps-btn primary',
             type: 'button',
             'data-ps-btn': 'export',
-            title: 'Ctrl+S',
+            title: saved?.path ? `Ctrl+S · ${saved.path}` : `Ctrl+S · ${t('actions.saveHint')}`,
             disabled: busy === 'export' || slides.length === 0,
             onClick: () => { void saveDeck() },
           }, busy === 'export' ? t('actions.exporting') : t('actions.save')),
-          saved?.path
-            ? h('button', { className: 'ps-btn', type: 'button', 'data-ps-btn': 'download', title: saved.path, onClick: downloadDeck }, t('actions.download'))
-            : null,
+          h('button', {
+            className: 'ps-btn',
+            type: 'button',
+            'data-ps-btn': 'download',
+            title: `Ctrl+Shift+S · ${t('actions.downloadHint')}`,
+            disabled: !deckId || busy !== '' || slides.length === 0,
+            onClick: () => { void downloadDeck() },
+          }, busy === 'download' ? t('actions.downloading') : t('actions.download')),
         ),
 
-        // Workflow steps: research → HTML preview → slides.
+        // Workflow steps: ⓪ template → ① research → ② HTML preview → ③ slides.
         steps,
+
+        // The running step, its deck and its elapsed time (live progress that
+        // does not depend on the user finding the tool card in the chat).
+        taskBanner,
 
         // Editing zone: the slide/panel surface is a visually separate card.
         h('div', { className: 'ps-editor', 'data-ps-editor': '1' },
           h('div', { className: 'ps-editor-head' },
             h('span', { className: 'ps-zone-label' }, t('zone.editor')),
-            h('span', { className: 'ps-zone-sub' }, activeView === 'slides' ? t('zone.slide') : activeView === 'research' ? t('stage.research') : t('stage.preview')),
+            h('span', { className: 'ps-zone-sub' }, activeView === 'slides' ? t('zone.slide') : t(stageTitleKey(activeView === 'slides' ? 'build' : activeView))),
+            current && Number.isInteger(current.templateSlide)
+              ? h('span', {
+                  className: 'ps-tpl-chip',
+                  'data-ps-stage-template': String(current.templateSlide),
+                  title: fmt(t('template.fromSlide'), { n: current.templateSlide }),
+                }, `T${current.templateSlide}`)
+              : null,
             h('span', { style: { flex: 1 } }),
             draw
               ? h('span', { className: 'ps-draw-badge', 'data-ps-drawing': '1', title: fmt(t('status.elements'), { index: draw.slideIndex, done: Math.min(draw.done, draw.count), count: draw.count }) },
@@ -4450,7 +5476,7 @@ window.__ModuleLoader__.load({
                       style: { width: `${thumbWidth}px`, height: `${thumbHeight}px` },
                     })))
             : null,
-          activeView === 'research' ? researchPanel : activeView === 'preview' ? previewPanel : slideStage),
+          activeView === 'template' ? templatePanel : activeView === 'research' ? researchPanel : activeView === 'preview' ? previewPanel : slideStage),
 
         // A visible divider carries the "editor / controls" boundary.
         h('div', { className: 'ps-split', 'data-ps-split': '1' },
@@ -4736,76 +5762,145 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Tab title chip.
+     * Tab title chip. It carries a live dot while a pptx step is running, so
+     * the tab itself says the work is still going on.
      * @param {any} props - slot props.
      * @returns {import('react').ReactNode} node.
      */
     function TabTitle(props) {
       const t = typeof props.t === 'function' ? props.t : (key) => key
-      return h('span', null, t('tab.title'))
+      const task = useSessionTask(props.sessionId)
+      const running = Boolean(task && task.state === 'running')
+      return h('span', { className: 'ps-scope', 'data-ps-tab-task': running ? String(task.tool || 'busy') : '' },
+        t('tab.title'),
+        running ? h('span', { className: 'ps-tab-dot', 'aria-hidden': 'true' }) : null)
     }
 
+    /** Every `pptx_studio_*` tool gets a card (whoever runs, the canvas follows). */
+    const TOOL_CARD_KEYS = [
+      'pptx_studio_open',
+      'pptx_studio_template',
+      'pptx_studio_research',
+      'pptx_studio_preview',
+      'pptx_studio_deck',
+      'pptx_studio_plan',
+      'pptx_studio_slide',
+      'pptx_studio_add_element',
+      'pptx_studio_patch',
+      'pptx_studio_inspect',
+      'pptx_studio_verify',
+      'pptx_studio_export',
+    ]
+
     /**
-     * Tool-call card for `pptx_studio_open`: one-click entry to the canvas.
+     * Tool-call card for every `pptx_studio_*` tool: it switches the right-hand
+     * canvas to the deck this call writes (and focuses it) the moment the call
+     * shows up, and reports the step's progress next to the result.
+     *
+     * The regression it guards: opening the canvas only for `pptx_studio_open`,
+     * or only once the call returned, leaves the user staring at the previous
+     * build (or at the conversation) while the agent draws the new deck.
+     *
      * @param {any} props - tool view props.
      * @returns {import('react').ReactNode} node.
      */
-    function OpenCard(props) {
+    function StudioCard(props) {
       const t = typeof props.t === 'function' ? props.t : (key, values) => fmt(key, values)
       const phase = props.phase
+      const toolName = typeof props.toolName === 'string' && props.toolName !== '' ? props.toolName : 'pptx_studio_open'
       const args = props.block && props.block.args
-      const title = (args && typeof args.text === 'function' && args.text('title')) || ''
-      const template = (args && typeof args.text === 'function' && args.text('template')) || ''
+      const readArg = (key) => {
+        try {
+          const value = args && typeof args.text === 'function' ? args.text(key) : ''
+          return typeof value === 'string' ? value : ''
+        } catch {
+          return ''
+        }
+      }
+      const title = readArg('title')
+      const template = readArg('template')
+      const argDeckId = readArg('deck') || readArg('deckId')
       const resultValue = (props.block && props.block.result && props.block.result.value) || null
+      const resultDeckId = resultValue && typeof resultValue.deckId === 'string' ? resultValue.deckId : ''
+      // `pptx_studio_open` only learns its deck from the receipt; every other
+      // step names the deck in its arguments, so the tab can switch before it runs.
+      const deckId = resultDeckId || argDeckId
       const slideCount = resultValue && typeof resultValue.slides === 'number' ? resultValue.slides : null
+      const failedResult = resultValue && resultValue.ok === false ? String(resultValue.message || resultValue.code || '') : ''
       const [opened, setOpened] = useState(false)
       const [failed, setFailed] = useState('')
-      const autoRef = useRef(false)
-      const resultRef = useRef(false)
       const running = phase === 'preparing' || phase === 'start'
+      const autoRef = useRef(false)
+      /** Deck the tab was last pointed at by this card (`''` = pending shell). */
+      const pointedRef = useRef('')
 
-      const resultDeckId = resultValue && typeof resultValue.deckId === 'string' ? resultValue.deckId : ''
       const open = useCallback((params) => {
         try {
-          const opened_ = props.openStudio ? props.openStudio(params) : false
-          const success = opened_ !== false
+          const success = (props.openStudio ? props.openStudio(params) : false) !== false
           setOpened(success)
           setFailed(success ? '' : t('card.noTab'))
+          return success
         } catch {
           setFailed(t('card.noTab'))
+          return false
         }
       }, [props, t])
 
-      // Open the canvas the moment the call shows up — while the agent is still
-      // streaming its arguments or executing — instead of waiting for the result.
-      // The whole point of the canvas is to watch the drawing happen; opening it
-      // afterwards would show the finished deck as one silent frame.
+      // Open — and focus — the canvas the moment the call shows up, pointing it
+      // at the deck this step writes. A brand-new `pptx_studio_open` has no deck
+      // yet, so it opens "pending": the canvas shows the preparing shell for
+      // this call instead of the previous build's deck.
       useEffect(() => {
+        if (!running) return
+        if (deckId !== '') {
+          if (pointedRef.current === deckId) return
+          pointedRef.current = deckId
+          autoRef.current = true
+          open({ deckId, at: Date.now() })
+          return
+        }
         if (autoRef.current) return
-        if (phase !== 'preparing' && phase !== 'start' && phase !== 'result') return
         autoRef.current = true
-        open()
-      }, [open, phase])
+        pointedRef.current = ''
+        open(toolName === 'pptx_studio_open' ? { pending: '1', nonce: Date.now() } : {})
+      }, [deckId, open, running, toolName])
 
-      // Once the deck exists, point the (already open) tab at it, so a tab that
-      // was showing the previous build switches to the one being drawn.
+      // The deck only exists once the call ran (`pptx_studio_open` returns it):
+      // navigate the tab that opened with the call to it. A card that mounts on
+      // an old result must not steal focus — only a card that opened the tab does.
       useEffect(() => {
-        if (phase !== 'result' || resultDeckId === '' || resultRef.current) return
-        resultRef.current = true
-        open({ deckId: resultDeckId })
-      }, [open, phase, resultDeckId])
+        if (phase !== 'result' || deckId === '' || !autoRef.current) return
+        if (pointedRef.current === deckId) return
+        pointedRef.current = deckId
+        open({ deckId, at: Date.now() })
+      }, [deckId, open, phase])
 
-      return h('div', { className: 'ps-card', 'data-pptx-studio-card': props.callId || '', 'data-opened': String(opened) },
-        h('div', { className: 'hd' }, t(running ? 'card.titleRunning' : 'card.title'),
+      const hint = running
+        ? (opened ? t('card.live') : t('card.opening'))
+        : (deckId !== '' ? t('card.following') : t('card.noDeckYet'))
+      return h('div', {
+        className: 'ps-card ps-scope',
+        'data-pptx-studio-card': props.callId || '',
+        'data-ps-card-tool': toolName,
+        'data-ps-card-deck': deckId,
+        'data-opened': String(opened),
+      },
+        h('div', { className: 'hd' }, toolLabel(t, toolName),
           h('span', { className: 'badge' }, t(running ? 'card.badgeRunning' : 'card.badgeDone'))),
         h('div', { className: 'sub' },
-          title || '(untitled)',
+          title || (deckId !== '' ? deckId : '(untitled)'),
           template ? ` · template: ${template}` : '',
           slideCount !== null ? ` · ${fmt(t('card.slides'), { count: slideCount })}` : '',
         ),
-        running ? h('div', { className: 'sub', 'data-ps-card-hint': opened ? 'live' : 'opening' }, opened ? t('card.live') : t('card.opening')) : null,
+        h('div', { className: 'sub', 'data-ps-card-hint': opened ? 'live' : 'opening' }, hint),
+        failedResult ? h('div', { className: 'ps-err', 'data-ps-card-failed': '1' }, fmt(t('card.failed'), { message: failedResult })) : null,
         h('div', { className: 'ps-row' },
-          h('button', { className: 'ps-btn primary', type: 'button', 'data-ps-btn': 'card-open', onClick: () => open() }, t('card.open')),
+          h('button', {
+            className: 'ps-btn primary',
+            type: 'button',
+            'data-ps-btn': 'card-open',
+            onClick: () => open(deckId !== '' ? { deckId, at: Date.now() } : (toolName === 'pptx_studio_open' ? { pending: '1', nonce: Date.now() } : {})),
+          }, t('card.open')),
           opened ? h('span', { className: 'sub' }, t('card.opened')) : null,
           failed ? h('span', { className: 'ps-err' }, failed) : null,
         ),
@@ -4859,7 +5954,26 @@ window.__ModuleLoader__.load({
         ))
 
         /**
-         * Open the canvas for one session (called from the tool card).
+         * Focus the canvas tab this session already has (in any pane) so the
+         * open below lands on it instead of opening a second canvas beside it.
+         * @param {any} controller - sidebarRight controller.
+         * @param {string} sessionId - session that owns the tab.
+         * @returns {void}
+         */
+        const focusExistingTab = (controller, sessionId) => {
+          try {
+            const active = typeof controller.active === 'function' ? controller.active() : undefined
+            if (active && active.kind === TAB_KIND) return
+            const tabs = typeof controller.tabsIn === 'function' ? controller.tabsIn(sessionId) : null
+            const mine = Array.isArray(tabs) ? tabs.find((record) => record && record.kind === TAB_KIND) : null
+            if (mine && typeof controller.focus === 'function') controller.focus(mine.id)
+          } catch {
+            /* older sidebars: `openTab` alone still opens/reveals the canvas */
+          }
+        }
+
+        /**
+         * Open the canvas for one session (called from the tool cards).
          *
          * `openTab` needs a session on screen; `openTabIn` works for adopted
          * sessions; when neither applies we first bring the session up and
@@ -4874,6 +5988,9 @@ window.__ModuleLoader__.load({
           try {
             const mounted = controller.mounted?.getSnapshot?.()
             if (mounted === sessionId && typeof controller.openTab === 'function') {
+              // A split sidebar can hold the canvas in a second pane; focus it
+              // first so `openTab` reveals that one instead of adding another.
+              focusExistingTab(controller, sessionId)
               controller.openTab(TAB_KIND, options)
               return true
             }
@@ -4901,13 +6018,16 @@ window.__ModuleLoader__.load({
           return false
         }
 
-        // ③ tool card for `pptx_studio_open` (auto-opens the canvas on result).
-        ctx.slots.inject('tool.call.toolview', () => ctx.slots.register({
-          name: 'tool.call.toolview',
-          key: 'pptx_studio_open',
-          locale: NS,
-          inject: (sessionId) => ({ openStudio: openerFor(sessionId) }),
-        }, OpenCard))
+        // ③ tool cards: one per pptx tool, so *any* step switches the right-hand
+        // canvas to its deck and shows the progress (not just the open call).
+        for (const key of TOOL_CARD_KEYS) {
+          ctx.slots.inject('tool.call.toolview', () => ctx.slots.register({
+            name: 'tool.call.toolview',
+            key,
+            locale: NS,
+            inject: (sessionId) => ({ openStudio: openerFor(sessionId) }),
+          }, StudioCard))
+        }
       },
     }
   },

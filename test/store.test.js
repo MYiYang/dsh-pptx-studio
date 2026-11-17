@@ -34,6 +34,11 @@ test('ensureInside keeps children and rejects escapes', () => {
   const inside = ensureInside(root, join(root, 'a', 'b'))
   assert.ok(inside.endsWith('b'))
   assert.throws(() => ensureInside(root, join(root, '..', 'evil')), /escapes/)
+  // A path on another drive is absolute after `relative()`, not `..`-prefixed:
+  // it must still be refused (this used to be accepted on Windows).
+  if (process.platform === 'win32') {
+    assert.throws(() => ensureInside(root, 'C:\\Users\\someone\\file.pptx'), /escapes/)
+  }
 })
 
 test('open creates a deck directory and persists deck.json', () => {

@@ -7,10 +7,12 @@
  */
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
+
+import { PythonRunner, runProcess } from '../lib/python.js'
 
 const plugin = await import('../index.js')
 
@@ -129,6 +131,8 @@ function fakeResponse() {
     end(chunk) {
       if (chunk !== undefined) res.chunks.push(Buffer.from(chunk))
     },
+    // An SSE route hangs its cleanup on the response's close event.
+    on() { return res },
   }
   Object.defineProperty(res, 'body', { get: () => Buffer.concat(res.chunks) })
   Object.defineProperty(res, 'text', { get: () => res.body.toString('utf8') })
@@ -147,6 +151,9 @@ async function call(method, pathWithQuery, body) {
   assert.ok(route, 'the plugin registered a web route')
   const req = fakeRequest(method, `/dsh-pptx-studio/api${pathWithQuery}`, body)
   const res = fakeResponse()
+  // SSE routes keep the response open; hand the request back so a test can
+  // close the stream when it is done with it.
+  res.request = req
   await route.handler(req, res)
   return res
 }
@@ -159,13 +166,13 @@ const exec = { agent: { session: { id: 'sess-e2e', cwd: workspace } } }
  */
 const tool = (name) => tools.find((t) => t.name === name)
 
-await test('apply registers ten pptx_studio tools and the web route', async () => {
+await test('apply registers twelve pptx_studio tools and the web route', async () => {
   await plugin.apply(ctx, {})
-  assert.equal(tools.length, 10)
+  assert.equal(tools.length, 12)
   for (const name of [
-    'pptx_studio_open', 'pptx_studio_research', 'pptx_studio_preview', 'pptx_studio_deck',
-    'pptx_studio_plan', 'pptx_studio_slide', 'pptx_studio_add_element', 'pptx_studio_patch',
-    'pptx_studio_inspect', 'pptx_studio_export',
+    'pptx_studio_open', 'pptx_studio_template', 'pptx_studio_research', 'pptx_studio_preview',
+    'pptx_studio_deck', 'pptx_studio_plan', 'pptx_studio_slide', 'pptx_studio_add_element',
+    'pptx_studio_patch', 'pptx_studio_inspect', 'pptx_studio_verify', 'pptx_studio_export',
   ]) {
     assert.ok(tool(name), `missing ${name}`)
     assert.equal(typeof tool(name).execute, 'function')
@@ -194,6 +201,12 @@ let insertedSlideId = ''
 let singleDeckId = ''
 /** Deck-relative src of the uploaded image. */
 let uploadedSrc = ''
+/** Deck id of the template-mode deck. */
+let tplDeckId = ''
+/** Its directory on disk. */
+let tplDeckDir = ''
+/** Requirement decomposition used by the template scenario. */
+let tplOutline = []
 await test('research → HTML preview gates the flow, then slides draw three pages', async () => {
   const opened = await tool('pptx_studio_open').execute({ title: 'E2E deck' }, exec)
   assert.equal(opened.ok, true)
@@ -207,6 +220,10 @@ await test('research → HTML preview gates the flow, then slides draw three pag
   assert.equal(blocked.code, 'stage-research')
   assert.match(blocked.hint, /pptx_studio_research/)
   assert.ok(lossless(blocked))
+  // A refusal has to reach the model with its reasons, not just a code.
+  const blockedCard = tool('pptx_studio_plan').output.render({}, blocked)
+  assert.match(blockedCard[0].text, /stage-research/)
+  assert.match(blockedCard[0].text, /pptx_studio_research/)
 
   const researched = await tool('pptx_studio_research').execute({
     deck: deckId,
@@ -362,17 +379,33 @@ await test('add_element appends and patch merges', async () => {
   assert.ok(lossless(patched))
 })
 
-await test('a malformed slide payload draws but reports what was fixed', async () => {
-  const written = await tool('pptx_studio_slide').execute({
+await test('data errors refuse the write; repairable warnings still draw', async () => {
+  // Error level (unsupported type, five-number box): refused, deck untouched.
+  const refused = await tool('pptx_studio_slide').execute({
     deck: deckId,
     index: 3,
     slide: { elements: [{ type: 'video', box: [1, 1, 2, 0.8, 'oops'], text: 'bad' }] },
   }, exec)
-  assert.equal(written.ok, true, 'a recoverable payload must still draw')
-  assert.equal(written.elements, 1)
-  assert.ok(Array.isArray(written.issues) && written.issues.length >= 2, `issues: ${JSON.stringify(written.issues)}`)
-  assert.ok(lossless(written), 'issues must survive the snapshot rule')
-  const rendered = tool('pptx_studio_slide').output.render({}, written)
+  assert.equal(refused.ok, false, 'an error-level payload must not be written')
+  assert.equal(refused.code, 'invalid-data')
+  assert.match(refused.hint, /type=/, 'the receipt names the offending field')
+  assert.match(refused.hint, /box 必须是 4 个数字/)
+  assert.ok(lossless(refused), 'the refusal must survive the snapshot rule')
+  const after = await tool('pptx_studio_inspect').execute({ deck: deckId }, exec)
+  assert.equal(after.deck.slideCount, 3, 'a refused write must not add the page')
+  assert.ok(!after.deck.slides.some((s) => s.elements.some((el) => el.text === 'bad')), 'a refused element must not land anywhere')
+
+  // Warning level (unknown field): repaired, drawn, and named.
+  const drawn = await tool('pptx_studio_slide').execute({
+    deck: deckId,
+    index: 3,
+    slide: { elements: [{ id: 't', type: 'text', box: [0.8, 0.6, 8, 0.9], text: 'ok', style: { size: 24 }, bogus: 1 }] },
+  }, exec)
+  assert.equal(drawn.ok, true, 'a repairable payload must still draw')
+  assert.equal(drawn.elements, 1)
+  assert.ok(Array.isArray(drawn.issues) && drawn.issues.some((line) => /未知字段 "bogus"/.test(line)), `issues: ${JSON.stringify(drawn.issues)}`)
+  assert.ok(lossless(drawn), 'issues must survive the snapshot rule')
+  const rendered = tool('pptx_studio_slide').output.render({}, drawn)
   assert.match(rendered[0].text, /参数已修正/)
 
   const clean = await tool('pptx_studio_slide').execute({
@@ -727,7 +760,14 @@ await test('POST /export and GET /download serve pptx bytes (lazy export include
   assert.equal(Number(download.headers['content-length']), download.body.length)
   assert.equal(download.body.subarray(0, 2).toString('latin1'), 'PK')
 
-  // This deck was never exported: /download must run the exporter first.
+  // This deck was never exported and holds an empty page: the export gate
+  // must refuse it (a blank page in the deliverable is a data mistake), then
+  // the same deck must export once the page has content.
+  const gated = await call('GET', `/download?deck=${encodeURIComponent(singleDeckId)}`)
+  assert.equal(gated.statusCode, 500, 'an empty page must not reach the .pptx')
+  assert.equal(gated.json.code, 'invalid-data')
+  const filled = await call('POST', '/edit', { deckId: singleDeckId, ops: [{ kind: 'element.add', slideId: 's1', element: { type: 'text', box: [1, 1, 4, 1], text: 'lazy export' } }] })
+  assert.equal(filled.statusCode, 200)
   const lazy = await call('GET', `/download?deck=${encodeURIComponent(singleDeckId)}`)
   assert.equal(lazy.statusCode, 200)
   assert.equal(lazy.body.subarray(0, 2).toString('latin1'), 'PK')
@@ -735,6 +775,33 @@ await test('POST /export and GET /download serve pptx bytes (lazy export include
   const missing = await call('GET', '/download?deck=deck_missing')
   assert.equal(missing.statusCode, 404)
   assert.equal(missing.json.code, 'deck-not-found')
+})
+
+await test('export accepts a folder the user picked and never overwrites a file', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pptx-studio-out-'))
+  try {
+    const first = await call('POST', '/export', { deckId, dir })
+    assert.equal(first.statusCode, 200)
+    assert.equal(first.json.ok, true)
+    assert.equal(dirname(first.json.value.path), dir, 'the file must land in the picked folder')
+    assert.match(first.json.value.path, /\.pptx$/)
+    assert.ok(existsSync(first.json.value.path), 'the export must actually write the file')
+
+    const second = await call('POST', '/export', { deckId, dir })
+    assert.equal(second.statusCode, 200)
+    assert.notEqual(second.json.value.path, first.json.value.path, 'a second save must not eat the first file')
+    assert.match(second.json.value.path, / \(1\)\.pptx$/)
+
+    const relative = await call('POST', '/export', { deckId, dir: 'relative/folder' })
+    assert.equal(relative.statusCode, 400)
+    assert.equal(relative.json.code, 'bad-directory')
+
+    const absent = await call('POST', '/export', { deckId, dir: join(dir, 'nope') })
+    assert.equal(absent.statusCode, 400)
+    assert.equal(absent.json.code, 'bad-directory')
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 await test('a deck written to disk is still listed and loadable after a plugin reload', async () => {
@@ -826,6 +893,336 @@ await test('deck/delete drops memory + disk and refuses junk ids', async () => {
   assert.ok(!existsSync(liveDir), 'in-memory delete removes the directory')
   const after = await call('GET', '/decks?sessionId=sess-e2e')
   assert.ok(!after.json.decks.some((item) => item.id === liveId), 'in-memory delete removes the entry')
+})
+
+// ── template-first workflow ────────────────────────────────────────────────
+// Built on a synthetic template (no PowerPoint needed: decomposition runs with
+// render:false, which is the documented degraded mode). Every assertion here is
+// about the guarantee the feature exists for: copy is mapped once, and the HTML
+// sheet, the slides and the exported file cannot drift apart.
+
+const assetsDir = new URL('../assets', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')
+const pythonRunner = new PythonRunner({ assetsDir, log: () => {} })
+
+/**
+ * Whether this machine can build a synthetic template (needs python-pptx).
+ * @returns {Promise<string|null>} interpreter path, or null when unavailable.
+ */
+async function templateInterpreter() {
+  let python = null
+  try {
+    python = await pythonRunner.interpreter()
+  } catch {
+    return null
+  }
+  const probe = await runProcess(python, ['-c', 'import pptx; print(pptx.__version__)'], { timeoutMs: 60_000 })
+  return probe.code === 0 ? python : null
+}
+
+/**
+ * Write a 3-page template (cover / content / ending) into the workspace.
+ * @param {string} python - interpreter with python-pptx.
+ * @param {string} target - .pptx path.
+ * @returns {Promise<void>} resolves once written.
+ */
+async function writeSyntheticTemplate(python, target) {
+  const script = `
+from pptx import Presentation
+from pptx.util import Inches, Pt
+prs = Presentation()
+prs.slide_width = Inches(13.333)
+prs.slide_height = Inches(7.5)
+blank = prs.slide_layouts[6]
+
+s0 = prs.slides.add_slide(blank)
+box = s0.shapes.add_textbox(Inches(1.2), Inches(2.6), Inches(10.9), Inches(1.6))
+tf = box.text_frame
+tf.text = "封面标题"
+tf.paragraphs[0].runs[0].font.size = Pt(44)
+
+s1 = prs.slides.add_slide(blank)
+t1 = s1.shapes.add_textbox(Inches(1.0), Inches(0.8), Inches(11.3), Inches(1.0))
+t1.text_frame.text = "页标题"
+t1.text_frame.paragraphs[0].runs[0].font.size = Pt(32)
+t2 = s1.shapes.add_textbox(Inches(1.0), Inches(2.2), Inches(11.3), Inches(2.4))
+t2.text_frame.word_wrap = True
+t2.text_frame.text = "这里是正文内容示例，用来占位说明这一页要讲的信息。"
+t2.text_frame.paragraphs[0].runs[0].font.size = Pt(16)
+
+s2 = prs.slides.add_slide(blank)
+t3 = s2.shapes.add_textbox(Inches(4.2), Inches(3.2), Inches(5.0), Inches(1.2))
+t3.text_frame.text = "谢谢观看"
+t3.text_frame.paragraphs[0].runs[0].font.size = Pt(40)
+prs.save(r"${target.replace(/\\/g, '\\\\')}")
+`
+  const result = await runProcess(python, ['-c', script], { timeoutMs: 120_000 })
+  assert.equal(result.code, 0, `template build failed: ${result.stderr}`)
+}
+
+const tplPython = await templateInterpreter()
+
+if (!tplPython) {
+  console.log('skip - no python-pptx on this machine (template e2e stays unproven)')
+} else {
+  await test('a template deck cannot skip decomposition', async () => {
+    const templatePath = join(workspace, 'brand-template.pptx')
+    await writeSyntheticTemplate(tplPython, templatePath)
+    assert.ok(statSync(templatePath).size > 0, 'the synthetic template exists')
+
+    const opened = await tool('pptx_studio_open').execute({ title: '模板流程 deck', template: 'brand-template.pptx' }, exec)
+    assert.equal(opened.ok, true)
+    assert.equal(opened.mode, 'template')
+    assert.equal(opened.stage, 'template', 'a template deck starts at the template stage')
+    assert.ok(lossless(opened))
+    tplDeckId = opened.deckId
+    tplDeckDir = join(workspace, '.pptx-studio', tplDeckId)
+
+    // Neither research nor slides may come first.
+    const earlyResearch = await tool('pptx_studio_research').execute({ deck: tplDeckId, brief: { summary: 'x', outline: [{ title: 'A' }] } }, exec)
+    assert.equal(earlyResearch.ok, false)
+    assert.equal(earlyResearch.code, 'stage-template')
+    assert.match(earlyResearch.hint, /pptx_studio_template/)
+    const earlyPlan = await tool('pptx_studio_plan').execute({ deck: tplDeckId, slides: [{ title: 'A' }] }, exec)
+    assert.equal(earlyPlan.ok, false)
+    assert.equal(earlyPlan.code, 'stage-template')
+  })
+
+  await test('a template outside the workspace is imported instead of refused', async () => {
+    // Users point at ~/Downloads; the plugin must copy it in, not read ambient
+    // paths later (and the old containment check let a cross-drive path through).
+    const outside = join(tmpdir(), `pptx-outside-${Date.now()}.pptx`)
+    await writeSyntheticTemplate(tplPython, outside)
+    const opened = await tool('pptx_studio_open').execute({ title: '外部模板', template: outside }, exec)
+    assert.equal(opened.ok, true, JSON.stringify(opened))
+    assert.equal(opened.stage, 'template')
+    const recorded = (await tool('pptx_studio_inspect').execute({ deck: opened.deckId }, exec)).deck.template
+    assert.ok(recorded.startsWith(workspace), `the recorded template must live in the workspace: ${recorded}`)
+    assert.ok(recorded.includes('_templates'), 'the imported copy lives in the plugin store')
+    assert.ok(existsSync(recorded), 'the imported copy exists on disk')
+    rmSync(recorded, { force: true })
+  })
+
+  await test('decomposition reports pages, roles and fillable fields', async () => {
+    const decomposed = await tool('pptx_studio_template').execute({ deck: tplDeckId, pages: 3, render: false }, exec)
+    assert.equal(decomposed.ok, true, JSON.stringify(decomposed))
+    assert.equal(decomposed.template.pages, 3)
+    assert.equal(decomposed.template.engine, 'none', 'render:false is the structural mode')
+    assert.deepEqual(Object.keys(decomposed.template.roles).sort(), ['content', 'cover', 'ending'])
+    assert.equal(decomposed.pages.length, 3)
+    for (const page of decomposed.pages) assert.match(page.fields, /≤\d+字/)
+    assert.ok(lossless(decomposed))
+    assert.ok(existsSync(join(tplDeckDir, 'template', 'template.json')), 'the spec lands on disk')
+    const pipeline = (await tool('pptx_studio_inspect').execute({ deck: tplDeckId }, exec)).deck.pipeline
+    assert.equal(pipeline.stage, 'research', 'decomposition unlocks the analysis step')
+    assert.equal(pipeline.template.decomposed, true)
+  })
+
+  await test('the canvas can read the template catalogue and design tokens', async () => {
+    const catalogue = await call('GET', `/template?deck=${tplDeckId}&cwd=${encodeURIComponent(workspace)}`)
+    assert.equal(catalogue.statusCode, 200)
+    assert.equal(catalogue.json.pages.length, 3)
+    assert.ok(Array.isArray(catalogue.json.design.palette))
+    assert.ok(catalogue.json.pages[0].fields.length >= 1)
+    assert.equal(catalogue.json.mapping, null, 'nothing mapped yet')
+  })
+
+  await test('requirement decomposition is refused when it does not fit the template', async () => {
+    const wrongField = await tool('pptx_studio_research').execute({
+      deck: tplDeckId,
+      brief: { summary: '需求', outline: [{ title: '封面', templateSlide: 0, fields: { nope: 'x' } }] },
+    }, exec)
+    assert.equal(wrongField.ok, false)
+    assert.equal(wrongField.code, 'template-mapping-invalid')
+    assert.match(wrongField.hint, /没有这个字段/)
+
+    const noMapping = await tool('pptx_studio_research').execute({
+      deck: tplDeckId,
+      brief: { summary: '需求', outline: [{ title: '封面' }] },
+    }, exec)
+    assert.equal(noMapping.ok, false)
+    assert.equal(noMapping.code, 'template-mapping-required')
+  })
+
+  await test('research maps requirements onto template pages, then HTML is generated from it', async () => {
+    const catalogue = (await call('GET', `/template?deck=${tplDeckId}&cwd=${encodeURIComponent(workspace)}`)).json.pages
+    // Every field id comes from the template, and copy is sized to the slot so
+    // the mapping check has nothing to complain about.
+    tplOutline = catalogue.map((page, index) => ({
+      title: index === 0 ? '敦煌夜游' : index === 1 ? '活动目的' : '谢谢',
+      templateSlide: page.page,
+      fields: Object.fromEntries(page.fields.map((field) => [
+        field.id,
+        (index === 0 && field.id === 'title' ? '敦煌夜游' : `文案${index + 1}`).slice(0, Math.max(1, field.maxCjk)),
+      ])),
+    }))
+    const researched = await tool('pptx_studio_research').execute({
+      deck: tplDeckId,
+      brief: {
+        summary: '把敦煌文化做成一场城市夜游。',
+        audience: '城市青年',
+        goal: '记住三个敦煌符号',
+        outline: tplOutline,
+        sources: [{ title: '敦煌研究院', url: 'https://www.e-dunhuang.com/', note: '素材来源' }],
+      },
+    }, exec)
+    assert.equal(researched.ok, true, JSON.stringify(researched))
+    assert.deepEqual(researched.templateMapping.templateSlides, [0, 1, 2])
+    assert.ok(lossless(researched))
+
+    const previewed = await tool('pptx_studio_preview').execute({ deck: tplDeckId, title: 'HTML 模版' }, exec)
+    assert.equal(previewed.ok, true, JSON.stringify(previewed))
+    assert.equal(previewed.mode, 'template')
+    assert.equal(previewed.pages, 3)
+    assert.deepEqual(previewed.templateSlides, [0, 1, 2])
+    assert.ok(lossless(previewed))
+  })
+
+  await test('GET /preview renders the HTML template from the same mapping', async () => {
+    const preview = await call('GET', `/preview?deck=${tplDeckId}&cwd=${encodeURIComponent(workspace)}`)
+    assert.equal(preview.statusCode, 200)
+    assert.equal((preview.text.match(/class="slide"/g) || []).length, 3)
+    assert.match(preview.headers['content-security-policy'], /sandbox/)
+    assert.match(preview.text, /data-field="title"/)
+    assert.match(preview.text, /敦煌夜游/, 'the mapped copy is in the sheet')
+    // No plates in structural mode: the page keeps the template background.
+    assert.match(preview.text, /background:#/)
+  })
+
+  await test('slides built from the template inherit its geometry and provenance', async () => {
+    const planned = await tool('pptx_studio_plan').execute({
+      deck: tplDeckId,
+      slides: tplOutline.map((item) => ({ title: item.title, templateSlide: item.templateSlide })),
+    }, exec)
+    assert.equal(planned.ok, true)
+    assert.equal(planned.total, 3)
+
+    for (const [index, item] of tplOutline.entries()) {
+      const written = await tool('pptx_studio_slide').execute({
+        deck: tplDeckId,
+        index: index + 1,
+        templateSlide: item.templateSlide,
+        fields: item.fields,
+      }, exec)
+      assert.equal(written.ok, true, JSON.stringify(written))
+      assert.equal(written.templateSlide, item.templateSlide)
+    }
+    const inspected = (await tool('pptx_studio_inspect').execute({ deck: tplDeckId }, exec)).deck
+    assert.equal(inspected.slideCount, 3)
+    assert.deepEqual(inspected.slides.map((slide) => slide.templateSlide), [0, 1, 2])
+    assert.ok(inspected.slides[0].elements.some((el) => el.field === 'title'), 'field provenance is exposed to the model')
+
+    // A slide write that names a field the page does not have never lands
+    // silently: with nothing left to draw it refuses and says why.
+    const bad = await tool('pptx_studio_slide').execute({
+      deck: tplDeckId, index: 2, templateSlide: 1, fields: { notAField: 'x' },
+    }, exec)
+    assert.equal(bad.ok, false)
+    assert.equal(bad.code, 'template-slide-empty')
+    assert.match(bad.hint, /没有字段 "notAField"/)
+    assert.match(bad.hint, /title/, 'the receipt lists the field ids the page does have')
+    const kept = (await tool('pptx_studio_inspect').execute({ deck: tplDeckId }, exec)).deck.slides[1]
+    assert.ok(kept.elements.some((el) => el.field === 'title'), 'a refused write leaves the previous page alone')
+  })
+
+  await test('verify passes, and export refuses a deck that drifted from its HTML', async () => {
+    const verified = await tool('pptx_studio_verify').execute({ deck: tplDeckId }, exec)
+    assert.equal(verified.ok, true, JSON.stringify(verified))
+    assert.equal(verified.consistent, true)
+    assert.equal(verified.templateMode, true)
+
+    // Rewrite one slide's copy without touching the HTML sheet: that is exactly
+    // the drift this feature exists to catch.
+    const first = (await tool('pptx_studio_inspect').execute({ deck: tplDeckId }, exec)).deck.slides[0]
+    const titleEl = first.elements.find((el) => el.field === 'title')
+    const patched = await tool('pptx_studio_patch').execute({
+      deck: tplDeckId, slideId: first.id, elementId: titleEl.id, patch: { text: '偷偷改掉的标题' },
+    }, exec)
+    assert.equal(patched.ok, true)
+
+    const inconsistent = await tool('pptx_studio_verify').execute({ deck: tplDeckId }, exec)
+    assert.equal(inconsistent.ok, false)
+    assert.ok(inconsistent.issues.some((line) => /文字不一致/.test(line)), JSON.stringify(inconsistent.issues))
+    const refused = await tool('pptx_studio_export').execute({ deck: tplDeckId }, exec)
+    assert.equal(refused.ok, false)
+    assert.equal(refused.code, 'template-inconsistent')
+    assert.ok(lossless(refused))
+    const refusedCard = tool('pptx_studio_export').output.render({}, refused)
+    assert.match(refusedCard[0].text, /template-inconsistent/)
+    assert.match(refusedCard[0].text, /文字不一致/, 'the rendered card carries the issue list')
+
+    // Re-sync the sheet to the deck, then the export goes through.
+    const resync = await tool('pptx_studio_preview').execute({
+      deck: tplDeckId,
+      pages: tplOutline.map((item, index) => ({
+        templateSlide: item.templateSlide,
+        title: item.title,
+        fields: index === 0 ? { ...item.fields, title: '偷偷改掉的标题' } : item.fields,
+      })),
+    }, exec)
+    assert.equal(resync.ok, true, JSON.stringify(resync))
+    const clean = await tool('pptx_studio_verify').execute({ deck: tplDeckId }, exec)
+    assert.equal(clean.ok, true, JSON.stringify(clean.issues))
+    const exported = await tool('pptx_studio_export').execute({ deck: tplDeckId }, exec)
+    assert.equal(exported.ok, true, JSON.stringify(exported))
+    assert.equal(exported.slides, 3)
+    assert.ok(existsSync(exported.path))
+    assert.ok(existsSync(join(tplDeckDir, 'template', 'template.json')))
+  })
+}
+
+await test('the session feed names the running step and the deck it writes', async () => {
+  const quiet = await call('GET', '/session?sessionId=sess-quiet')
+  assert.equal(quiet.json.ok, true)
+  assert.equal(quiet.json.task, null, 'a session that never ran a pptx tool has no task')
+
+  // The canvas opens *before* the deck exists, so the feed has to push: a
+  // snapshot answered on demand would arrive too late to switch the tab.
+  const stream = await call('GET', '/session/events?sessionId=sess-feed')
+  const frames = () => stream.text.split('\n\n')
+    .filter((row) => row.startsWith('data: '))
+    .map((row) => JSON.parse(row.slice(6)))
+  const opening = frames()
+  assert.ok(opening.length >= 1, 'the stream must open with a snapshot')
+  assert.equal(opening[0].type, 'task')
+  assert.equal(opening[0].task, null, 'nothing runs in a fresh session yet')
+
+  const feedExec = { agent: { session: { id: 'sess-feed', cwd: workspace } } }
+  const opened = await tool('pptx_studio_open').execute({ title: 'Feed deck' }, feedExec)
+  assert.equal(opened.ok, true)
+  const events = frames().slice(opening.length).map((frame) => frame.task)
+  assert.ok(events.length >= 2, 'a call must publish its start and its outcome')
+  const started = events[0]
+  assert.equal(started.tool, 'pptx_studio_open')
+  assert.equal(started.state, 'running')
+  assert.equal(started.label, '打开画布', 'the canvas needs a human label, not the wire name')
+  assert.equal(started.deckId, '', 'the open call has no deck while it runs: the canvas must wait, not show the old one')
+  const finished = events[events.length - 1]
+  assert.equal(finished.state, 'done')
+  assert.equal(finished.deckId, opened.deckId, 'the outcome carries the deck the canvas must switch to')
+  assert.ok(finished.seq > started.seq, 'seq only grows, so a reconnecting canvas can order snapshots')
+
+  // A step that writes an existing deck names it up front (from its arguments),
+  // so the canvas switches before the tool returns.
+  const before = frames().length
+  const inspected = await tool('pptx_studio_inspect').execute({ deck: opened.deckId }, feedExec)
+  assert.equal(inspected.ok, true)
+  const inspectEvents = frames().slice(before).map((frame) => frame.task)
+  assert.equal(inspectEvents[0].deckId, opened.deckId, 'a step that writes a deck must announce that deck at call time')
+  assert.equal(inspectEvents[inspectEvents.length - 1].deckId, opened.deckId, 'and keep it after the call')
+
+  // The on-demand snapshot a reconnecting tab asks for is the last task.
+  const snapshot = await call('GET', '/session?sessionId=sess-feed')
+  assert.equal(snapshot.json.task.tool, 'pptx_studio_inspect')
+  assert.equal(snapshot.json.task.state, 'done')
+
+  // A failing call must not leave the canvas claiming work is still running.
+  const failed = await tool('pptx_studio_export').execute({ deck: 'deck_missing' }, feedExec)
+  assert.equal(failed.ok, false)
+  const failedSnapshot = await call('GET', '/session?sessionId=sess-feed')
+  assert.equal(failedSnapshot.json.task.state, 'failed')
+  assert.ok(failedSnapshot.json.task.message.length > 0, 'the failure carries the host reason')
+
+  stream.request.emit('close')
 })
 
 rmSync(join(workspace, '.pptx-studio'), { recursive: true, force: true })

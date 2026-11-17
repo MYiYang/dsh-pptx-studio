@@ -145,4 +145,143 @@ await test('PythonRunner resolves a python with python-pptx (or degrades)', asyn
   assert.equal(plain.features.timings, 0)
 })
 
+await test('a cartesian chart pins its value axis to the canvas scale', async () => {
+  const runner = new PythonRunner({ assetsDir: new URL('../assets', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'), log: () => {} })
+  const python = await runner.interpreter()
+  if (python === null) {
+    console.log('skip - no python-pptx on this machine (export stays unavailable)')
+    return
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'pptx-studio-axis-'))
+  const deck = {
+    version: 2,
+    id: 'deck_axis',
+    title: 'axis',
+    size: { w: 13.333, h: 7.5 },
+    theme: { colors: { accent: '2563EB' } },
+    slides: [{
+      id: 's1',
+      elements: [
+        { id: 'c1', type: 'chart', box: [1, 1, 5, 3], chart: { kind: 'column', categories: ['a', 'b', 'c'], series: [{ name: 's', values: [10, 25, 18] }] } },
+        { id: 'c2', type: 'chart', box: [7, 1, 5, 3], chart: { kind: 'line', categories: ['a', 'b', 'c'], series: [{ name: 's', values: [40, 20, 30] }] } },
+      ],
+    }],
+  }
+  const deckFile = join(dir, 'deck.json')
+  writeFileSync(deckFile, JSON.stringify(deck), 'utf8')
+  const out = join(dir, 'deck.pptx')
+  const built = await runner.run('pptx_build.py', [deckFile, out])
+  assert.equal(built.features.charts, 2)
+  const probe = await runProcess(python, ['-c', [
+    'import json, sys',
+    'from pptx import Presentation',
+    'from pptx.enum.chart import XL_CHART_TYPE',
+    'p = Presentation(sys.argv[1])',
+    'axes = []',
+    'for s in p.slides:',
+    '    for sh in s.shapes:',
+    '        if sh.has_chart and sh.chart.chart_type not in (XL_CHART_TYPE.PIE, XL_CHART_TYPE.DOUGHNUT):',
+    '            va = sh.chart.value_axis',
+    '            axes.append([va.minimum_scale, va.maximum_scale, va.major_unit])',
+    'print(json.dumps({"axes": axes}))',
+  ].join('\n'), out], { timeoutMs: 60_000 })
+  assert.equal(probe.code, 0, probe.stderr)
+  const axes = parseJsonOutput(probe.stdout).axes
+  // Same scale client.js#axisScale picks: [10,25,18] -> 0/30/10; [40,20,30] -> 0/40/10.
+  assert.deepEqual(axes[0], [0, 30, 10], 'the exported axis must match the canvas scale (0/30/10)')
+  assert.deepEqual(axes[1], [0, 40, 10], 'the exported axis must match the canvas scale (0/40/10)')
+})
+
+await test('the design-sheet chart style reaches the export (bare bars, gradient, labels)', async () => {
+  const runner = new PythonRunner({ assetsDir: new URL('../assets', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'), log: () => {} })
+  const python = await runner.interpreter()
+  if (python === null) {
+    console.log('skip - no python-pptx on this machine (export stays unavailable)')
+    return
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'pptx-studio-style-'))
+  const deck = {
+    version: 2,
+    id: 'deck_style',
+    title: 'style',
+    size: { w: 13.333, h: 7.5 },
+    theme: { colors: { accent: '22D3EE', surface: 'F1F5F9' } },
+    slides: [{
+      id: 's1',
+      background: { color: '#0F172A' },
+      elements: [
+        { id: 'bare', type: 'chart', box: [1, 1, 7, 4], chart: { kind: 'column', categories: ['a', 'b', 'c'], axis: 'none', gradient: ['#22D3EE', '#0E7490'], dataLabels: true, corner: 0.1, series: [{ name: 's', values: [10, 25, 18], color: '#22D3EE' }] } },
+      ],
+    }],
+  }
+  const deckFile = join(dir, 'deck.json')
+  writeFileSync(deckFile, JSON.stringify(deck), 'utf8')
+  const out = join(dir, 'deck.pptx')
+  const built = await runner.run('pptx_build.py', [deckFile, out])
+  assert.equal(built.features.charts, 1)
+  const probe = await runProcess(python, ['-c', [
+    'import json, re, sys, zipfile',
+    'z = zipfile.ZipFile(sys.argv[1])',
+    'name = [n for n in z.namelist() if n.startswith("ppt/charts/chart")][0]',
+    'xml = z.read(name).decode("utf-8")',
+    '# python-pptx writes a bare <c:delete/> (val defaults to true) for a hidden axis.',
+    'deleted = [t for t in re.findall(r"<c:delete[^>]*>", xml) if \'val="0"\' not in t]',
+    'print(json.dumps({',
+    '  "axesDeleted": len(deleted) >= 2,',
+    '  "gridlinesOff": "<c:majorGridlines/>" not in xml,',
+    '  "gradient": "<a:gradFill" in xml and "22D3EE" in xml and "0E7490" in xml,',
+    '  "dataLabels": "<c:dLbls>" in xml,',
+    '  "autoTitleOff": \'<c:autoTitleDeleted val="1"/>\' in xml,',
+    '  "roundRect": \'prst="roundRect"\' in xml,',
+    '}))',
+  ].join('\n'), out], { timeoutMs: 60_000 })
+  assert.equal(probe.code, 0, probe.stderr)
+  const facts = parseJsonOutput(probe.stdout)
+  assert.equal(facts.axesDeleted, true, 'axis:"none" must delete both axes in the export')
+  assert.equal(facts.gridlinesOff, true, 'axis:"none" must drop the gridlines')
+  assert.equal(facts.gradient, true, 'the gradient stops must land in the chart XML')
+  assert.equal(facts.dataLabels, true, 'dataLabels must emit c:dLbls')
+  assert.equal(facts.autoTitleOff, true, 'the single-series auto title must be suppressed')
+  assert.equal(facts.roundRect, true, 'corner must become a roundRect geometry')
+})
+
+await test('contrast picking reads the plate under each field', async () => {
+  const assetsPath = new URL('../assets', import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1')
+  const runner2 = new PythonRunner({ assetsDir: assetsPath, log: () => {} })
+  let python = null
+  try {
+    python = await runner2.interpreter()
+  } catch {
+    console.log('skip - no python-pptx on this machine (export stays unavailable)')
+    return
+  }
+  const probeDir = mkdtempSync(join(tmpdir(), 'pptx-contrast-'))
+  const script = [
+    'import json, sys',
+    'from PIL import Image',
+    'sys.path.insert(0, ' + JSON.stringify(assetsPath) + ')',
+    'import pptx_template',
+    'out = sys.argv[1]',
+    'import os',
+    'os.makedirs(os.path.join(out, "plates"), exist_ok=True)',
+    'img = Image.new("RGB", (1600, 900), (250, 245, 235))',
+    'img.paste((40, 18, 8), (0, 0, 1600, 300))',
+    'img.save(os.path.join(out, "plates", "s0.jpg"))',
+    'fields = [',
+    '    {"id": "onDark", "box": [0.5, 0.4, 4, 0.8], "style": {}},',
+    '    {"id": "onLight", "box": [0.5, 5.0, 6, 1.2], "style": {}},',
+    '    {"id": "fixed", "box": [0.5, 5.0, 6, 1.2], "style": {"color": "#123456"}},',
+    ']',
+    'pptx_template.apply_contrast_colors([{"plate": "plates/s0.jpg", "fields": fields}], out, 13.333, 7.5)',
+    'print(json.dumps({f["id"]: f["style"].get("color") for f in fields}))',
+  ].join('\n')
+  const result = await runProcess(python, ['-c', script, probeDir], { timeoutMs: 60_000 })
+  assert.equal(result.code, 0, result.stderr)
+  const picked = parseJsonOutput(result.stdout)
+  assert.ok(!picked.onDark.startsWith('#5F2311'), 'copy on a dark band must not stay dark')
+  assert.ok(['#FFFFFF', '#FFF8EC'].includes(picked.onDark), `dark band picked ${picked.onDark}`)
+  assert.ok(['#2B1206', '#4A2410'].includes(picked.onLight), `light band picked ${picked.onLight}`)
+  assert.equal(picked.fixed, '#123456', 'an explicit colour is never overridden')
+})
+
 console.log(`\npython: ${passed} checks passed`)

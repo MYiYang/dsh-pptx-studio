@@ -6,8 +6,11 @@ import assert from 'node:assert/strict'
 
 import {
   applyElementPatch,
+  auditChart,
+  auditDeck,
   auditElement,
   auditSlide,
+  collectElementIssues,
   createDeck,
   normalizeAnimation,
   normalizeChart,
@@ -291,6 +294,75 @@ test('summarizeDeck exposes pipeline and per-slide effects', () => {
   assert.equal(summary.slides[0].transition.type, 'fade')
   assert.equal(summary.slides[0].notes, 'notes')
   assert.equal(summary.slides[0].elements[0].anim.effect, 'fade')
+})
+
+test('auditChart names every silently-repaired chart mistake', () => {
+  const clean = auditChart({ kind: 'column', categories: ['A', 'B'], series: [{ name: 's', values: [1, 2] }] }, 1)
+  assert.deepEqual(clean, { errors: [], warnings: [] }, 'a well-formed chart is silent')
+
+  const mismatched = auditChart({ categories: ['A'], series: [{ name: 's', values: [1, 2] }] }, 1)
+  assert.ok(mismatched.errors.some((line) => /categories 有 1 个，而最长的系列有 2 个值/.test(line)), 'category/series length mismatch must be named')
+
+  const nonNumeric = auditChart({ categories: ['A'], series: [{ name: 's', values: [1, 'two'] }] }, 1)
+  assert.ok(nonNumeric.errors.some((line) => /values\[1\]="two" 不是有限数字/.test(line)), 'a non-numeric value must be named')
+
+  const badGradient = auditChart({ categories: ['A'], series: [{ name: 's', values: [1] }], gradient: ['#22D3EE'] }, 1)
+  assert.ok(badGradient.errors.some((line) => /gradient 必须是两个十六进制颜色/.test(line)), 'a one-colour gradient must be named')
+
+  const typoAxis = auditChart({ categories: ['A'], series: [{ name: 's', values: [1] }], axis: 'non' }, 1)
+  assert.ok(typoAxis.errors.some((line) => /axis="non" 不受支持/.test(line)), 'a mistyped axis must be named, not silently defaulted')
+
+  const typoField = auditChart({ categories: ['A'], series: [{ name: 's', values: [1] }], datalabels: true }, 1)
+  assert.ok(typoField.errors.some((line) => /未知字段 "datalabels"/.test(line)), 'a mistyped chart key must be named')
+
+  const noSeries = auditChart({ categories: ['A'] }, 1)
+  assert.ok(noSeries.errors.some((line) => /至少需要一个系列/.test(line)), 'a chart without series must be named')
+
+  const noName = auditChart({ categories: ['A'], series: [{ values: [1] }] }, 1)
+  assert.ok(noName.warnings.some((line) => /缺 name/.test(line)), 'a missing series name is a warning')
+})
+
+test('auditElement catches off-canvas boxes, bad colours and bad type sizes', () => {
+  const size = { w: 13.333, h: 7.5 }
+  const offCanvas = collectElementIssues({ id: 'e', type: 'rect', box: [12, 6.9, 2, 1] }, 0, size)
+  assert.ok(offCanvas.errors.some((line) => /超出画布/.test(line)), 'a box past the page edge must be an error')
+
+  const inside = collectElementIssues({ id: 'e', type: 'rect', box: [1, 1, 2, 1] }, 0, size)
+  assert.deepEqual(inside.errors, [], 'a box inside the page is silent')
+
+  const badColor = collectElementIssues({ id: 'e', type: 'text', box: [1, 1, 2, 1], text: 'x', style: { color: 'blue' } }, 0, size)
+  assert.ok(badColor.errors.some((line) => /style.color="blue" 不是十六进制颜色/.test(line)), 'a named colour must be refused')
+
+  // 120pt display type is normal in a template cover, so the cap has to allow
+  // it; only genuinely impossible sizes are refused.
+  const displayType = collectElementIssues({ id: 'e', type: 'text', box: [1, 1, 2, 1], text: 'x', style: { size: 120 } }, 0, size)
+  assert.deepEqual(displayType.errors, [], '120pt is display type, not a mistake')
+  const badSize = collectElementIssues({ id: 'e', type: 'text', box: [1, 1, 2, 1], text: 'x', style: { size: 500 } }, 0, size)
+  assert.ok(badSize.errors.some((line) => /style\.size=500 不是 0–400/.test(line)), 'an impossible point size must be refused')
+})
+
+test('auditDeck grades the whole model and checks the design-sheet page count', () => {
+  const good = {
+    id: 'd', size: { w: 13.333, h: 7.5 },
+    slides: [{ id: 's1', elements: [{ id: 'e', type: 'text', box: [1, 1, 2, 1], text: 'x' }] }],
+  }
+  assert.deepEqual(auditDeck(good), { errors: [], warnings: [] })
+
+  const blank = { id: 'd', size: { w: 13.333, h: 7.5 }, slides: [{ id: 's1', elements: [] }] }
+  assert.ok(auditDeck(blank).errors.some((line) => /空白页/), 'an empty page must be an error')
+
+  const drifted = {
+    id: 'd', size: { w: 13.333, h: 7.5 },
+    pipeline: { preview: { html: '<div class="slide">a</div><div class="slide">b</div>' } },
+    slides: [{ id: 's1', elements: [{ id: 'e', type: 'text', box: [1, 1, 2, 1], text: 'x' }] }],
+  }
+  assert.ok(auditDeck(drifted).warnings.some((line) => /HTML 设计稿有 2 页，而幻灯片有 1 页/.test(line)), 'sheet/slide page drift must be named')
+
+  const offPage = {
+    id: 'd', size: { w: 13.333, h: 7.5 },
+    slides: [{ id: 's1', elements: [{ id: 'e', type: 'rect', box: [13, 7, 2, 1] }] }],
+  }
+  assert.ok(auditDeck(offPage).errors.some((line) => /超出画布/), 'off-canvas elements surface at deck level too')
 })
 
 console.log(`\nmodel: ${passed} checks passed`)
